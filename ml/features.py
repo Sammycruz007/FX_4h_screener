@@ -33,6 +33,11 @@ WHAT'S ADDED, REPLACING THE ABOVE:
      Currency Strength Index computation. This is the primary
      relative-strength feature: "how is this pair's base doing
      broadly vs. how is its quote doing broadly."
+   - csi_diff_zscore / csi_diff_roc — csi_rs normalised against its
+     own rolling history (macro-overextension) and differenced over a
+     short lag (RS-gap momentum/exhaustion), respectively. Both
+     computed in engines/csi.py alongside csi_rs itself — see that
+     module for the exact windows (config-driven, not hardcoded).
    - csi_commodity_bloc — replaces Market Pulse's market-context role.
      A regime signal (is the AUD/NZD/CAD commodity bloc moving
      together right now), shared across all pairs at a given
@@ -305,11 +310,15 @@ def compute_signal_features(
     project — pure price-action, timeframe/asset-agnostic):
     - adx_value, plus_di, minus_di
 
-    GROUP 7 — Currency Strength Index (2 features, replacing Market
+    GROUP 7 — Currency Strength Index (4 features, replacing Market
     Pulse AND both relative_strength features):
     - csi_rs             : CSI_base - CSI_quote — this pair's relative
                            strength (e.g. EURUSD's csi_rs = CSI_EUR -
                            CSI_USD)
+    - csi_diff_zscore    : csi_rs normalised against its own rolling
+                           history — macro-overextension signal
+    - csi_diff_roc       : csi_rs differenced over a short lag — RS-gap
+                           momentum/exhaustion signal
     - csi_commodity_bloc : mean CSI across AUD/NZD/CAD — shared regime
                            signal, same value for every pair at a
                            given timestamp
@@ -437,14 +446,27 @@ def compute_signal_features(
     # this signal_datetime (CSI is inherently cross-pair — see
     # engines/csi.py) — this function just looks up this pair's row.
     csi_rs             = 0.0
+    csi_diff_zscore    = 0.0
+    csi_diff_roc       = 0.0
     csi_commodity_bloc = 0.0
     if csi_df is not None and not csi_df.empty:
         csi_row = csi_df[csi_df["pair"] == pair]
         if not csi_row.empty:
-            csi_rs_val = csi_row.iloc[0]["csi_rs"]
-            bloc_val   = csi_row.iloc[0]["csi_commodity_bloc"]
+            row0 = csi_row.iloc[0]
+            # .get() with a default rather than bare ["col"] indexing —
+            # a csi_df missing one of these columns (e.g. an older
+            # snapshot, or a caller not yet updated to the 4-feature
+            # CSI output) degrades to the same 0.0 fallback used for a
+            # missing row, instead of raising KeyError and taking down
+            # feature computation for this candidate.
+            csi_rs_val = row0.get("csi_rs", np.nan)
+            zscore_val = row0.get("csi_diff_zscore", np.nan)
+            roc_val    = row0.get("csi_diff_roc", np.nan)
+            bloc_val   = row0.get("csi_commodity_bloc", np.nan)
             csi_rs             = float(csi_rs_val) if pd.notna(csi_rs_val) else 0.0
-            csi_commodity_bloc = float(bloc_val) if pd.notna(bloc_val) else 0.0
+            csi_diff_zscore    = float(zscore_val) if pd.notna(zscore_val) else 0.0
+            csi_diff_roc       = float(roc_val)    if pd.notna(roc_val)    else 0.0
+            csi_commodity_bloc = float(bloc_val)   if pd.notna(bloc_val)   else 0.0
 
     # ── Direction encoding ────────────────────────────────────────────────────
     # 1 = long setup, 0 = short setup
@@ -488,6 +510,8 @@ def compute_signal_features(
 
         # Group 7: Currency Strength Index
         "csi_rs"             : round(csi_rs,             6),
+        "csi_diff_zscore"    : round(csi_diff_zscore,    6),
+        "csi_diff_roc"       : round(csi_diff_roc,       6),
         "csi_commodity_bloc" : round(csi_commodity_bloc, 6),
 
         # Direction
@@ -632,6 +656,8 @@ SIGNAL_FEATURE_COLS = [
     "minus_di",
     # Currency Strength Index (replaces Market Pulse + both RS features)
     "csi_rs",
+    "csi_diff_zscore",
+    "csi_diff_roc",
     "csi_commodity_bloc",
     # Direction
     "direction_flag",
