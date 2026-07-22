@@ -394,9 +394,10 @@ def run_training():
 
     if csi_series_df.empty:
         logger.warning(
-            "CSI backfill produced no rows — csi_rs and csi_commodity_bloc "
-            "will be 0.0 for all training examples. This will weaken the "
-            "model but training will still proceed."
+            "CSI backfill produced no rows — csi_rs, csi_diff_zscore, "
+            "csi_diff_roc, and csi_commodity_bloc will all be 0.0 for "
+            "all training examples. This will weaken the model but "
+            "training will still proceed."
         )
     else:
         logger.info(f"CSI backfill complete | {len(csi_series_df)} (pair, datetime) rows")
