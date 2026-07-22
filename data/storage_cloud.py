@@ -13,31 +13,39 @@ of raw 4H OHLCV history to backfill indicators and give the model
 exposure to multiple market regimes. This module holds that history
 cheaply.
 
-NOT A ROLLING WINDOW — this one accumulates and keeps ALL history by
-design. The whole point of accumulating snapshots run over run is full
-regime coverage in training, so pruning old snapshots here would
-actively work against that goal. read_price_history() defaults to
-reading everything ever written.
+NOT A SIMPLE ROLLING WINDOW, BUT NOT UNBOUNDED EITHER — CONSOLIDATION:
+This module accumulates history and is not a naive "last N days"
+rolling window (a rolling read would silently lose the large first-run
+backfill once it aged out — see read_price_history()'s docstring).
+But leaving snapshot FILES to accumulate forever isn't right either:
+Supabase's free tier caps total object count as well as total bytes,
+and with runs happening twice a day (see scheduler.run_times in
+config.yaml), file count would grow unbounded even though the
+underlying DATA volume stays small and bounded by
+storage.retention_days (~2.5 years). consolidate_snapshots() is called
+every pipeline run: it reads everything, dedupes on (pair, datetime),
+trims anything older than retention_days, writes ONE fresh
+consolidated file, then deletes every old chunk — safe because the
+new file already captured everything worth keeping before the old
+ones are removed. See consolidate_snapshots()'s own docstring for the
+full mechanics and why this is safer than a naive age-based delete.
 
-WHY WE DON'T DELETE SNAPSHOTS AFTER EACH PIPELINE RUN (a real question,
-not a hypothetical — worth stating explicitly): these snapshots are
-NOT a cache for the run that wrote them. Postgres never holds raw
-prices at all (see above) — this bucket is the ONLY persistent copy of
-price history that exists anywhere in this architecture.
-train_models.py's read_price_history() reconstructs the FULL backfill
-window from ALL accumulated snapshots — that is the entire mechanism
-by which training gets multi-regime historical data. Deleting a
-snapshot right after its run would permanently lose that day's data —
-not re-fetchable later, since yfinance's history window is finite
-(fetcher.py's 729-day 1H ceiling). It would also break fetcher.py's
-incremental fetch design: smart_fetch() deliberately pulls only tiny
-NEW deltas on every run after the first, relying on accumulated
-Storage history for everything older. Delete-per-run would force a
-choice between re-fetching the full 729-day history every single run
-(defeating incremental fetch entirely) or permanently losing all
-history older than one run (breaking multi-regime training). Neither
-is acceptable, so snapshots accumulate indefinitely by design, exactly
-as this module's original stock-project version also concluded.
+WHY WE DON'T JUST DELETE SNAPSHOTS RIGHT AFTER EACH RUN, THOUGH (a
+real question, worth stating explicitly): these snapshots are NOT a
+cache for the run that wrote them. Postgres never holds raw prices at
+all (see above) — this bucket is the ONLY persistent copy of price
+history that exists anywhere in this architecture. train_models.py's
+read_price_history() reconstructs the FULL backfill window from all
+accumulated history — that is the entire mechanism by which training
+gets multi-regime historical data. Deleting a run's data right after
+that run would permanently lose it (not re-fetchable later, since
+yfinance's history window is finite — fetcher.py's 729-day 1H
+ceiling), and would break fetcher.py's incremental fetch design, which
+relies on accumulated Storage history for everything older than its
+tiny per-run delta. Consolidation solves this correctly: it keeps
+every row inside the retention window, and only removes rows/files
+once they're genuinely outside it — never data the project still
+needs.
 
 TWICE-DAILY SCAN SCHEDULE CHANGES THE SNAPSHOT KEY (FX-specific fix):
 Per config.yaml's scheduler.run_times (["12:00", "20:00"] UTC), this
@@ -75,13 +83,13 @@ smaller part files (CHUNK_ROWS rows each) instead of one large file.
 Reading transparently reassembles all parts.
 
 USAGE:
-    write_snapshot(raw_df, run_timestamp)   # called from run_pipeline_cloud.py
+    write_snapshot(raw_df, run_timestamp)   # called from run_pipeline_cloud.py, every run
+    consolidate_snapshots(retention_days)   # called from run_pipeline_cloud.py, every run
     df = read_price_history()               # called from train_models.py — reads ALL history
-    # prune_old_snapshots() exists but should NOT be called in this
-    # project's normal flow — see docstring on that function. NOT
-    # wired into run_pipeline_cloud.py, matching this module's own
-    # design intent (accumulate forever, prune only on a deliberate,
-    # separate retention-policy decision later).
+    # prune_old_snapshots() still exists but is SUPERSEDED by
+    # consolidate_snapshots() above and is NOT called anywhere in this
+    # project — see its own docstring for why it's kept only for
+    # reference.
 
 REQUIRES:
     No extra package — uses plain HTTP calls to Supabase's Storage
@@ -136,6 +144,13 @@ CHUNK_ROWS = 500_000
 # filename. See module docstring's "TWICE-DAILY SCAN SCHEDULE" section.
 FILENAME_TS_FORMAT = "%Y-%m-%dT%H%M"
 
+# Consolidated snapshots (written by consolidate_snapshots(), see below)
+# are named "consolidated_{ts}_part000.parquet" to distinguish them from
+# individual per-run snapshots — defined here, near FILENAME_TS_FORMAT,
+# since _parse_run_timestamp_from_filename() needs to strip this prefix
+# before parsing the timestamp portion of a consolidated file's name.
+CONSOLIDATED_PREFIX = "consolidated"
+
 
 # =============================================================================
 # CONFIG / HEADERS
@@ -181,6 +196,15 @@ def _parse_run_timestamp_from_filename(name: str) -> Optional[datetime]:
 
     stem = name.replace(".parquet", "")
     ts_str = stem.split("_part")[0] if "_part" in stem else stem
+
+    # Consolidated files are named "consolidated_{ts}_part000.parquet" —
+    # strip that prefix before parsing, or strptime fails and this
+    # function returns None, silently making every consolidated
+    # snapshot invisible to read_price_history() (a real bug caught in
+    # testing: consolidation would "succeed" — write the new file,
+    # delete the old ones — but the new file could never be read back).
+    if ts_str.startswith(f"{CONSOLIDATED_PREFIX}_"):
+        ts_str = ts_str[len(f"{CONSOLIDATED_PREFIX}_"):]
 
     try:
         return datetime.strptime(ts_str, FILENAME_TS_FORMAT)
@@ -400,22 +424,209 @@ def read_raw_prices_cloud(pair: str, days: Optional[int] = None) -> pd.DataFrame
 
 
 # =============================================================================
-# PRUNE — exists but is NOT called anywhere in this project's normal flow
+# CONSOLIDATE — called every pipeline run from run_pipeline_cloud.py
+# Bounds both total Storage bytes AND object count (Supabase free tier
+# caps both) WITHOUT ever losing data still inside the retention
+# window — unlike a naive age-based prune, which could delete a chunk
+# containing rows that are still within the window just because the
+# chunk itself happens to be old.
+# =============================================================================
+
+def consolidate_snapshots(retention_days: int) -> bool:
+    """
+    Collapse ALL accumulated snapshot chunks (individual run deltas
+    AND any previous consolidated file) into ONE fresh, de-duplicated,
+    retention-trimmed snapshot, then delete every old chunk.
+
+    WHY THIS EXISTS: without any pruning, every pipeline run adds new
+    chunk files forever — twice a day, indefinitely. The underlying
+    data volume stays small (28 pairs, 4H candles, bounded by
+    retention_days — comfortably under Supabase's free-tier limits),
+    but the FILE COUNT does not stay bounded on its own, and Supabase's
+    free tier caps total object count as well as total bytes. A naive
+    age-based delete (the stock project's prune_old_snapshots, kept
+    below but never called) risks deleting a chunk that still contains
+    in-window rows, since a chunk's OWN age doesn't tell you the age of
+    the OLDEST row inside it once run-to-run overlaps get involved.
+    Consolidation sidesteps that entirely: read everything, keep only
+    rows that are actually still in-window, write that as the new
+    single source of truth, THEN delete the old files — by which point
+    every row worth keeping has already been captured in the new file.
+
+    FLOW:
+    1. Read every accumulated chunk via the existing read_price_history()
+       machinery (handles both individual run deltas and any prior
+       consolidated file identically — dedup logic doesn't care which
+       file a row came from)
+    2. Drop rows older than retention_days
+    3. Write the result as ONE new consolidated snapshot (still
+       chunked via the existing CHUNK_ROWS logic if it exceeds the
+       50MB/file limit)
+    4. Delete every old chunk file (both individual-run and any prior
+       consolidated file) that existed BEFORE this consolidation pass
+       — safe because step 3 already wrote everything worth keeping
+
+    Args:
+        retention_days: Rows older than this (from the current UTC
+                        time) are dropped during consolidation. Read
+                        live from config.yaml's storage.retention_days
+                        by the caller — not hardcoded here.
+
+    Returns:
+        True if consolidation completed and the old files were
+        cleaned up successfully, False on any failure (non-fatal —
+        pipeline should continue regardless; the old files simply
+        accumulate one more run's worth until the next successful
+        consolidation)
+    """
+    try:
+        base_url, headers = _get_config()
+
+        pre_consolidation_files = _list_snapshot_files(base_url, headers)
+        if not pre_consolidation_files:
+            logger.info("consolidate_snapshots: no existing snapshots, nothing to do")
+            return True
+
+        # ── Step 1 & 2: read everything, dedupe, trim to retention window ──
+        history = read_price_history()
+        if history.empty:
+            logger.warning("consolidate_snapshots: read_price_history returned nothing, aborting")
+            return False
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        # datetime column may be tz-aware (from fetcher.py's UTC-localized
+        # index) — compare accordingly rather than assume naive.
+        dt_col = pd.to_datetime(history["datetime"], utc=True)
+        before_trim = len(history)
+        history = history[dt_col >= cutoff].reset_index(drop=True)
+
+        logger.info(
+            f"consolidate_snapshots: {before_trim} rows read | "
+            f"{len(history)} rows within {retention_days}-day retention window "
+            f"({before_trim - len(history)} trimmed as too old)"
+        )
+
+        if history.empty:
+            logger.warning(
+                "consolidate_snapshots: all rows fell outside the retention "
+                "window — this would delete everything, aborting instead of proceeding"
+            )
+            return False
+
+        # ── Step 3: write ONE new consolidated snapshot ─────────────────────
+        consolidation_ts = datetime.now(timezone.utc).strftime(FILENAME_TS_FORMAT)
+        write_ok = _write_consolidated(history, consolidation_ts)
+
+        if not write_ok:
+            logger.warning(
+                "consolidate_snapshots: failed to write consolidated snapshot — "
+                "aborting BEFORE deleting old files, so no data is lost"
+            )
+            return False
+
+        # ── Step 4: delete every file that existed before this pass ────────
+        to_delete = [f"{PREFIX}/{f['name']}" for f in pre_consolidation_files]
+
+        resp = requests.delete(
+            f"{base_url}/object/{BUCKET_NAME}",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"prefixes": to_delete},
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        logger.info(
+            f"consolidate_snapshots: complete | "
+            f"Wrote 1 new consolidated snapshot ({len(history)} rows) | "
+            f"Deleted {len(to_delete)} old chunk files"
+        )
+        return True
+
+    except Exception as e:
+        logger.warning(f"consolidate_snapshots failed: {e} — continuing without it")
+        return False
+
+
+def _write_consolidated(df: pd.DataFrame, consolidation_ts: str) -> bool:
+    """
+    Write the fully-consolidated DataFrame as chunked Parquet files
+    under a CONSOLIDATED_PREFIX-tagged filename, distinguishing it from
+    individual per-run snapshots (both are read identically by
+    read_price_history() — the tag matters only for consolidate_snapshots()
+    itself to know what to delete on the NEXT consolidation pass).
+
+    Args:
+        df               : The trimmed, de-duplicated combined history
+        consolidation_ts : UTC timestamp string for this consolidation
+                           pass, used in the filename
+
+    Returns:
+        True if all chunks wrote successfully, False otherwise
+    """
+    try:
+        base_url, headers = _get_config()
+
+        n_chunks = max(1, (len(df) + CHUNK_ROWS - 1) // CHUNK_ROWS)
+        upload_headers = {
+            **headers,
+            "Content-Type": "application/octet-stream",
+            "x-upsert"    : "true",
+        }
+
+        chunks_written = 0
+
+        for i in range(n_chunks):
+            chunk = df.iloc[i * CHUNK_ROWS : (i + 1) * CHUNK_ROWS]
+            if chunk.empty:
+                continue
+
+            buffer = io.BytesIO()
+            chunk.to_parquet(buffer, engine="pyarrow", compression="snappy", index=False)
+            buffer.seek(0)
+            raw_bytes = buffer.read()
+
+            path = f"{PREFIX}/{CONSOLIDATED_PREFIX}_{consolidation_ts}_part{i:03d}.parquet"
+
+            resp = requests.post(
+                f"{base_url}/object/{BUCKET_NAME}/{path}",
+                headers=upload_headers,
+                data=raw_bytes,
+                timeout=60,
+            )
+
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    f"_write_consolidated: chunk {i} failed | "
+                    f"HTTP {resp.status_code} — {resp.text[:300]}"
+                )
+                continue
+
+            chunks_written += 1
+
+        return chunks_written == n_chunks
+
+    except Exception as e:
+        logger.warning(f"_write_consolidated failed: {e}")
+        return False
+
+
+# =============================================================================
+# LEGACY PRUNE — superseded by consolidate_snapshots() above, kept only
+# for reference. NOT called anywhere in this project.
 # =============================================================================
 
 def prune_old_snapshots(max_days: int = 60) -> int:
     """
     Delete Parquet snapshot chunks older than max_days from Supabase Storage.
 
-    ⚠️ DO NOT call this in this project's normal pipeline flow, and it
-    is deliberately NOT wired into run_pipeline_cloud.py. This
-    project's entire purpose for accumulating snapshots is preserving
-    FULL history for regime coverage in training — calling this would
-    delete exactly the data the project depends on. See this module's
-    top-level docstring, "WHY WE DON'T DELETE SNAPSHOTS AFTER EACH
-    PIPELINE RUN", for the full reasoning (incremental fetch relies on
-    this accumulated history existing; deleting it forces either a
-    full 729-day re-fetch every run or permanent data loss).
+    ⚠️ SUPERSEDED by consolidate_snapshots() above, which is the
+    function actually wired into run_pipeline_cloud.py. This blunt,
+    age-based version is kept only for reference — do NOT call it. It
+    has a real correctness gap consolidate_snapshots() was written to
+    avoid: a chunk's own filename age doesn't tell you whether every
+    row inside it is actually outside the retention window — deleting
+    purely by chunk age risks losing in-window data if any run's chunk
+    boundaries don't line up cleanly with the age cutoff.
 
     Kept here only in case retention policy changes deliberately in
     the future (e.g. capping to a fixed rolling window once the model
