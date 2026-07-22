@@ -153,10 +153,11 @@ def _build_pipeline(scale_pos_weight: float = 1.0) -> Pipeline:
 
     # Isotonic calibration — cv=5 uses out-of-fold predictions to map
     # probabilities without leaking data or overfitting to train set.
+    inner_cv = TimeSeriesSplit(n_splits=3, gap=safety_gap)
     calibrated_model = CalibratedClassifierCV(
         estimator = base_model,
         method    = "isotonic",
-        cv        = 5,
+        cv        = inner_cv,
     )
 
     pipeline = Pipeline([
