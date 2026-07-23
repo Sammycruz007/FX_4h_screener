@@ -64,6 +64,16 @@ OUTPUT per pair (latest candle):
                           over? csi_rs alone is a single snapshot and
                           can't see this on its own.
    - csi_commodity_bloc : mean CSI across AUD/NZD/CAD (regime feature)
+   - csi_base_zscore, csi_quote_zscore : DISPLAY-ONLY (dashboard
+                          gauges), NOT a model feature. Each currency's
+                          OWN CSI series z-scored against its own
+                          rolling ZSCORE_WINDOW history — distinct from
+                          csi_diff_zscore above, which z-scores the
+                          PAIR-LEVEL csi_rs, not a single currency's
+                          CSI in isolation. Gives the dashboard a
+                          bounded, ~[-3, +3] value per currency to plot
+                          on a gauge, matching the existing SD-position
+                          gauge style, instead of raw unbounded CSI.
 
 WHY THIS MATTERS FOR THE MODEL:
    CSI_base - CSI_quote answers "how is this pair's base doing broadly
@@ -283,6 +293,48 @@ def _compute_csi_per_currency(contributions: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
+# PER-CURRENCY Z-SCORE (for dashboard display)
+# Distinct from csi_diff_zscore (STEP 5b below), which z-scores the
+# PAIR-LEVEL csi_rs (CSI_base - CSI_quote). This z-scores each
+# CURRENCY'S OWN CSI series in isolation — e.g. "is USD's current CSI
+# high or low relative to USD's own recent history?" Added so the
+# dashboard's per-currency gauges can read a bounded, ~[-3, +3] value
+# (matching the existing SD-position gauge style) instead of raw,
+# unbounded CSI, which has no natural display scale of its own.
+# =============================================================================
+
+def _compute_currency_zscore(csi_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Z-score each currency's own CSI series against its own rolling
+    ZSCORE_WINDOW-candle history (same window as csi_diff_zscore, for
+    consistency — one config knob governs "how much history counts as
+    the baseline" everywhere in this engine).
+
+    Args:
+        csi_df: Output of _compute_csi_per_currency() — datetime-
+                indexed, one column per currency ('CSI_EUR', 'CSI_USD', ...)
+
+    Returns:
+        DataFrame, datetime-indexed, one column per currency named
+        'CSI_{currency}_zscore' (e.g. 'CSI_EUR_zscore')
+    """
+    result = {}
+
+    for currency in CURRENCIES:
+        col = f"CSI_{currency}"
+        if col not in csi_df.columns:
+            continue
+
+        series     = csi_df[col]
+        rolling_mean = series.rolling(window=ZSCORE_WINDOW).mean()
+        rolling_std  = series.rolling(window=ZSCORE_WINDOW).std()
+
+        result[f"{col}_zscore"] = (series - rolling_mean) / rolling_std
+
+    return pd.DataFrame(result)
+
+
+# =============================================================================
 # STEP 5 & 6 — PAIR-LEVEL RS AND COMMODITY-BLOC COHESION
 # =============================================================================
 
@@ -442,7 +494,8 @@ def run_csi_engine(
     Returns:
         DataFrame with one row per pair: [pair, date, csi_base,
         csi_quote, csi_rs, csi_diff_zscore, csi_diff_roc,
-        csi_commodity_bloc]
+        csi_commodity_bloc, csi_base_zscore, csi_quote_zscore]
+        (the last two are dashboard-display-only, see module docstring)
     """
     logger.info(f"CSI engine starting | {len(tickers_data)} pairs | Date: {date}")
 
@@ -467,6 +520,7 @@ def run_csi_engine(
     csi_df        = _compute_csi_per_currency(contributions)
     pair_features = _compute_pair_features(csi_df)
     zscore_roc    = _compute_zscore_and_roc(pair_features)
+    currency_zscore_df = _compute_currency_zscore(csi_df)
 
     commodity_bloc_latest = pair_features["__commodity_bloc__"].iloc[-1]
 
@@ -509,6 +563,24 @@ def run_csi_engine(
         csi_base_rounded  = round(float(csi_df[base_col].iloc[-1]), 6)
         csi_quote_rounded = round(float(csi_df[quote_col].iloc[-1]), 6)
 
+        # Per-currency zscore — DISPLAY feature only (dashboard gauges),
+        # not fed into the model. Deliberately does NOT trigger the same
+        # skip-the-row behaviour as csi_diff_zscore/csi_diff_roc above:
+        # those are training features where a NaN genuinely means "this
+        # row isn't usable yet." A missing display value just means the
+        # dashboard shows nothing for that one gauge — defaults to None
+        # rather than dropping an otherwise-valid, model-usable row.
+        base_zscore_col  = f"{base_col}_zscore"
+        quote_zscore_col = f"{quote_col}_zscore"
+        base_zscore_val  = (
+            currency_zscore_df[base_zscore_col].iloc[-1]
+            if base_zscore_col in currency_zscore_df.columns else np.nan
+        )
+        quote_zscore_val = (
+            currency_zscore_df[quote_zscore_col].iloc[-1]
+            if quote_zscore_col in currency_zscore_df.columns else np.nan
+        )
+
         results.append({
             "pair"               : pair,
             "date"               : date,
@@ -519,6 +591,8 @@ def run_csi_engine(
             "csi_diff_roc"       : round(float(latest_roc), 6),
             "csi_commodity_bloc" : round(float(commodity_bloc_latest), 6)
                                     if not pd.isna(commodity_bloc_latest) else None,
+            "csi_base_zscore"    : round(float(base_zscore_val), 6) if not pd.isna(base_zscore_val) else None,
+            "csi_quote_zscore"   : round(float(quote_zscore_val), 6) if not pd.isna(quote_zscore_val) else None,
         })
 
     logger.info(
