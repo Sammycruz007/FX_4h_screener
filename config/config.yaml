@@ -1,0 +1,216 @@
+database:
+  path: data/fx_scanner.db
+
+storage:
+  # Supabase Storage (Parquet snapshots, see data/storage_cloud.py) —
+  # NOT the same as `database.path` above, which is local SQLite.
+  # Consolidation runs every pipeline execution: reads all accumulated
+  # snapshot chunks, dedupes on (pair, datetime), trims anything older
+  # than retention_days, writes one fresh consolidated file, deletes
+  # every old chunk. Bounds both total Storage bytes AND object count
+  # (Supabase free tier caps both) without ever losing in-window data.
+  # 913 days ≈ 2.5 years — sized deliberately: 28 pairs × ~6 4H-candles/
+  # day × 913 days ≈ 153K rows steady-state, comfortably under the
+  # free-tier 1GB cap even before accounting for Parquet compression.
+  retention_days: 913
+
+fetcher:
+  batch_size: 25
+  max_workers: 7
+  retry_attempts: 3
+  retry_delay_seconds: 5
+  # CRITICAL: yfinance caps 1H (60m) history at 730 calendar days — unlike
+  # daily candles, which have no such cap. This was 1800 in the carried-over
+  # config (correct for the daily-stocks project, WRONG here — would have
+  # silently failed/truncated on the very first fetch). 729 leaves a
+  # 1-day safety buffer under the actual limit.
+  historical_days: 729
+  incremental_days: 10       # buffer for weekend/holiday gaps
+  fetch_interval: "1h"       # what we actually pull from yfinance
+  resample_interval: "4h"    # what we compute indicators/features on
+
+  # Session-anchored resampling — the Sunday-candle bug from the brainstorm.
+  # FX opens ~22:00 UTC Sunday (5PM EST), producing a partial first candle.
+  # Naive 4H binning without an explicit anchor drifts week to week, silently
+  # misaligning every LinReg/ADX/CSI calculation. Anchoring resample() to a
+  # fixed UTC origin (00:00) keeps 4H boundaries consistent every week,
+  # regardless of where the partial Sunday-open candle falls.
+  resample_origin_utc: "00:00"
+
+# NOTE: no `filters` section — Stage 1 filtering (min_avg_volume, min_price)
+# doesn't apply to FX. No such thing as meaningful "volume" for a
+# decentralized OTC market, and price LEVEL is an arbitrary quoting
+# convention (1.08 for EURUSD, 150 for USDJPY) — not a liquidity signal.
+# With a fixed 28-pair universe, there's also no funnel needed at all —
+# every pair gets scanned directly.
+
+linreg:
+  # NEEDS YOUR CONFIRMATION — this is a genuine design decision, not a
+  # mechanical unit conversion from the daily project's period=250.
+  # Proposed: 200 4H-candles ≈ several weeks of structure (~6 candles/
+  # trading day → ~33 trading days). Shorter than "250 daily = ~1 year"
+  # by design — a 4H regression channel spanning a full year would be
+  # extremely wide and likely useless for spotting swing extremes.
+  period: 200
+  std_devs:
+  - 1
+  - 2
+  - 3
+
+logging:
+  backup_count: 5
+  level: INFO
+  log_dir: logs
+  max_file_size_mb: 10
+
+ml:
+  high_probability_threshold: 0.65
+  # NEEDS YOUR CONFIRMATION — proposed: 30 4H-candles ≈ 5 trading days
+  # (~1 week) forward. Shorter horizon than the daily project's 60
+  # (≈3 months), matching the faster pace of a 4H timeframe.
+  label_forward_periods: 30
+  min_training_samples: 50
+  model_retrain_days: 7
+  backfill_stride: 1
+
+scanner:
+  long_entry_sd_max: -3
+  long_entry_sd_min: -1
+  short_entry_sd_max: 3
+  short_entry_sd_min: 1
+
+scheduler:
+  # DECIDED: 2 scans/day, not every H4 close (6x/day) and not once daily.
+  # Anchored to UTC (not local time) because the reasoning is inherently
+  # session-based, not timezone-of-the-user-based:
+  #   - 12:00 UTC: London session in full swing, right before New York
+  #     opens — the highest-liquidity, most information-dense candle of
+  #     the day for a mean-reversion/trend setup.
+  #   - 20:00 UTC: New York session's close, right as the next 4H candle
+  #     forms heading into the Asian session — the other genuinely
+  #     distinct liquidity regime.
+  # Both times land on real session transitions (see the `session`
+  # config section below) rather than arbitrary points in the day, and
+  # sit ~8 hours apart so the two scans aren't clustered on the same
+  # underlying market information.
+  run_times:
+  - "12:00"
+  - "20:00"
+  timezone: "UTC"
+
+smc:
+  choch_confirmation: close
+  # NEEDS YOUR CONFIRMATION — proposed: 40 4H-candles. Keeps the same
+  # "SMC lookback meaningfully smaller than LinReg period" relationship
+  # established for the stock projects (min_required = ×3 = 120 candles,
+  # safely below the 200-candle LinReg requirement above).
+  min_pivot_candles: 40
+
+# Fixed 28-pair universe — all unique combinations of the 8 major
+# currencies, standard FX quoting convention (base/quote order matches
+# market convention, not alphabetical). yfinance ticker format: "EURUSD=X".
+# CONFIRM this matches what you want before we lock it in.
+universe:
+  pairs:
+  - EURUSD
+  - GBPUSD
+  - USDJPY
+  - USDCAD
+  - USDCHF
+  - AUDUSD
+  - NZDUSD
+  - EURGBP
+  - EURJPY
+  - EURCHF
+  - EURAUD
+  - EURNZD
+  - EURCAD
+  - GBPJPY
+  - GBPCHF
+  - GBPAUD
+  - GBPNZD
+  - GBPCAD
+  - AUDJPY
+  - AUDCHF
+  - AUDNZD
+  - AUDCAD
+  - NZDJPY
+  - NZDCHF
+  - NZDCAD
+  - CADJPY
+  - CADCHF
+  - CHFJPY
+  currencies:               # the 8 majors CSI is computed for
+  - USD
+  - EUR
+  - GBP
+  - JPY
+  - AUD
+  - NZD
+  - CAD
+  - CHF
+
+adx:
+  period: 14   # Wilder's standard default — timeframe-invariant convention
+
+csi:
+  # Currency Strength Index — replaces Market Pulse (SPY/QQQ/DIA) and
+  # the sector-ETF-based Relative Strength from the stock projects.
+  # RS feature itself = CSI_base - CSI_quote for a given pair (e.g.
+  # EURUSD's RS = CSI_EUR - CSI_USD), computed in engines/csi.py.
+  # NEEDS YOUR CONFIRMATION — proposed lookback: 20 4H-candles (~3-4
+  # trading days) for the rolling return each currency's strength is
+  # averaged from.
+  lookback_period: 20
+  # csi_diff_zscore — normalises csi_rs (CSI_base - CSI_quote) against
+  # its OWN rolling history, so a pair-specific RS gap is comparable
+  # across all 28 pairs regardless of each pair's typical RS-gap
+  # magnitude ("is this pair's RS gap at a macro extreme right now?").
+  # 50 4H-candles ≈ 8 trading days — long enough to establish a
+  # meaningful rolling mean/std for the z-score, short enough to stay
+  # responsive to regime shifts.
+  zscore_window: 50
+  # csi_diff_roc — momentum/exhaustion on the RS gap itself: is it
+  # accelerating or rolling over? Differenced over 2 4H-candles (~8
+  # hours) — short enough to catch a genuine turn without being pure
+  # single-candle noise.
+  roc_lag: 2
+
+atr:
+  # Two ATR periods, per your request — ATR_14/ATR_100 as a volatility-
+  # regime feature (ratio >1 = expanding vol, <1 = compression/squeeze).
+  # Also the basis for normalizing every distance-based feature (dist to
+  # LinReg mean, band width, etc.) — critical for FX specifically, since
+  # price LEVEL isn't a meaningful unit here the way it loosely is for
+  # stocks (JPY pairs quote in 2 decimals, others in 4-5).
+  fast_period: 14
+  slow_period: 100
+
+candlestick:
+  # Hammer / Shooting Star detection — hand-crafted interaction with
+  # price extremes (per your decision), not left for XGBoost to
+  # discover on its own, given FX's smaller training-data volume
+  # (28 pairs vs ~1,800 stocks) makes explicit interactions more
+  # valuable here than they were for the stock projects.
+  # extreme_sd_threshold: how far from the LinReg mean (in SD bands) a
+  # candle needs to be for the pattern to count as "at an extreme"
+  # rather than mid-range noise.
+  # UPDATED per your explicit decision: matches the scanner's own
+  # long/short entry band (|sd_position| > 1) rather than a separately-
+  # tuned value — engines/candlestick.py hardcodes this same 1.0
+  # (EXTREME_SD_THRESHOLD), read here for documentation/consistency
+  # rather than as the code's actual source (the engine does not read
+  # this key live — see that module's docstring for why).
+  extreme_sd_threshold: 1.0
+
+session:
+  # UTC hour ranges for the session-indicator feature — free to compute
+  # from a candle's own timestamp, no new data source needed. Captures
+  # that FX behavior differs meaningfully by session (London-NY overlap
+  # = highest volatility; Asian session = often quieter/ranging).
+  tokyo_open_utc: 0
+  tokyo_close_utc: 9
+  london_open_utc: 8
+  london_close_utc: 17
+  new_york_open_utc: 13
+  new_york_close_utc: 22
