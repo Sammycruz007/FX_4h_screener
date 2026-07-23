@@ -133,6 +133,8 @@ def initialise_database() -> None:
             csi_diff_zscore      REAL,
             csi_diff_roc         REAL,
             csi_commodity_bloc   REAL,
+            csi_base_zscore      REAL,
+            csi_quote_zscore     REAL,
             is_hammer            INTEGER DEFAULT 0,
             is_shooting_star     INTEGER DEFAULT 0,
             created_at           TIMESTAMP DEFAULT NOW(),
@@ -177,9 +179,24 @@ def initialise_database() -> None:
         """,
     ]
 
+    # Migration statements — run AFTER the CREATE TABLE IF NOT EXISTS list
+    # above, since that only creates a table if it's entirely absent; it
+    # does NOT add new columns to a table that was already initialised
+    # before this change. Without these, csi_base_zscore/csi_quote_zscore
+    # (added when the per-currency dashboard z-score feature was built)
+    # would silently never appear on any database initialised before this
+    # point — write_indicator_results would then fail with an "unknown
+    # column" error the first time it tried to insert them.
+    migrations = [
+        "ALTER TABLE indicator_results ADD COLUMN IF NOT EXISTS csi_base_zscore REAL",
+        "ALTER TABLE indicator_results ADD COLUMN IF NOT EXISTS csi_quote_zscore REAL",
+    ]
+
     with get_connection() as conn:
         cursor = conn.cursor()
         for ddl in tables:
+            cursor.execute(ddl)
+        for ddl in migrations:
             cursor.execute(ddl)
 
     logger.info("Supabase database initialised — all tables ready")
@@ -208,6 +225,7 @@ def write_indicator_results(df: pd.DataFrame) -> int:
         "price_sd_position", "smc_structure", "has_valid_zone",
         "adx_value", "plus_di", "minus_di",
         "csi_rs", "csi_diff_zscore", "csi_diff_roc", "csi_commodity_bloc",
+        "csi_base_zscore", "csi_quote_zscore",
         "is_hammer", "is_shooting_star",
     ]
 
@@ -239,6 +257,7 @@ def write_indicator_results(df: pd.DataFrame) -> int:
             price_sd_position, smc_structure, has_valid_zone,
             adx_value, plus_di, minus_di,
             csi_rs, csi_diff_zscore, csi_diff_roc, csi_commodity_bloc,
+            csi_base_zscore, csi_quote_zscore,
             is_hammer, is_shooting_star
         ) VALUES (
             %(pair)s, %(datetime)s, %(linreg_value)s, %(linreg_slope)s, %(linreg_slope_up)s,
@@ -247,6 +266,7 @@ def write_indicator_results(df: pd.DataFrame) -> int:
             %(smc_structure)s, %(has_valid_zone)s,
             %(adx_value)s, %(plus_di)s, %(minus_di)s,
             %(csi_rs)s, %(csi_diff_zscore)s, %(csi_diff_roc)s, %(csi_commodity_bloc)s,
+            %(csi_base_zscore)s, %(csi_quote_zscore)s,
             %(is_hammer)s, %(is_shooting_star)s
         )
         ON CONFLICT (pair, datetime) DO UPDATE SET
@@ -269,6 +289,8 @@ def write_indicator_results(df: pd.DataFrame) -> int:
             csi_diff_zscore    = EXCLUDED.csi_diff_zscore,
             csi_diff_roc       = EXCLUDED.csi_diff_roc,
             csi_commodity_bloc = EXCLUDED.csi_commodity_bloc,
+            csi_base_zscore    = EXCLUDED.csi_base_zscore,
+            csi_quote_zscore   = EXCLUDED.csi_quote_zscore,
             is_hammer          = EXCLUDED.is_hammer,
             is_shooting_star   = EXCLUDED.is_shooting_star
     """
