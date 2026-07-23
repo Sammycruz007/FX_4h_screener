@@ -275,17 +275,26 @@ def run_full_pipeline():
         logger.warning(f"CSI engine failed: {e} — continuing with empty csi_df")
         csi_df = pd.DataFrame()
 
-    # Merge CSI's 4 features onto indicator_df so write_indicator_results
-    # persists them alongside LinReg/SMC/ADX in one row per pair.
+    # Merge CSI's 6 features onto indicator_df so write_indicator_results
+    # persists them alongside LinReg/SMC/ADX in one row per pair. Includes
+    # csi_base_zscore/csi_quote_zscore (dashboard-display-only, not a
+    # model feature — see engines/csi.py's module docstring) alongside
+    # the 4 model-feature CSI columns, since both sets live in the same
+    # indicator_results row and the dashboard reads from that same table.
+    csi_cols = [
+        "pair", "csi_rs", "csi_diff_zscore", "csi_diff_roc", "csi_commodity_bloc",
+        "csi_base_zscore", "csi_quote_zscore",
+    ]
     if not csi_df.empty:
         indicator_df = indicator_df.merge(
-            csi_df[["pair", "csi_rs", "csi_diff_zscore", "csi_diff_roc", "csi_commodity_bloc"]],
+            csi_df[csi_cols],
             on="pair",
             how="left",
         )
     else:
-        for col in ("csi_rs", "csi_diff_zscore", "csi_diff_roc", "csi_commodity_bloc"):
-            indicator_df[col] = None
+        for col in csi_cols:
+            if col != "pair":
+                indicator_df[col] = None
 
     try:
         rows_written = write_indicator_results(indicator_df)
