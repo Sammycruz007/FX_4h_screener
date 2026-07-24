@@ -12,7 +12,7 @@ storage:
   # 913 days ≈ 2.5 years — sized deliberately: 28 pairs × ~6 4H-candles/
   # day × 913 days ≈ 153K rows steady-state, comfortably under the
   # free-tier 1GB cap even before accounting for Parquet compression.
-  retention_days: 3100
+  retention_days: 4600
 
 fetcher:
   batch_size: 25
