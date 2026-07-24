@@ -330,13 +330,13 @@ def train_signal_ranker(
         "probability": y_pred_proba,
     }).sort_values("probability", ascending=False)
 
-    top_5_percent_cutoff = max(1, int(len(results_df) * 0.02))
+    top_2_percent_cutoff = max(1, int(len(results_df) * 0.02))
     top_signals          = results_df.head(top_2_percent_cutoff)
     top_precision        = top_signals["true_label"].mean()
 
     logger.info(
         f"Real Trading Metrics | "
-        f"Win Rate of Top 5% Signals: {top_precision:.4f} "
+        f"Win Rate of Top 2% Signals: {top_precision:.4f} "
         f"(Baseline: {y_test.mean():.4f})"
     )
 
