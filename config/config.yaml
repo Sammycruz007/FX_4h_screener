@@ -12,7 +12,7 @@ storage:
   # 913 days ≈ 2.5 years — sized deliberately: 28 pairs × ~6 4H-candles/
   # day × 913 days ≈ 153K rows steady-state, comfortably under the
   # free-tier 1GB cap even before accounting for Parquet compression.
-  retention_days: 913
+  retention_days: 2610
 
 fetcher:
   batch_size: 25
@@ -24,25 +24,12 @@ fetcher:
   # config (correct for the daily-stocks project, WRONG here — would have
   # silently failed/truncated on the very first fetch). 729 leaves a
   # 1-day safety buffer under the actual limit.
-  historical_days: 729
+  historical_days: 2600
   incremental_days: 10       # buffer for weekend/holiday gaps
-  fetch_interval: "1h"       # what we actually pull from yfinance
-  resample_interval: "4h"    # what we compute indicators/features on
+  fetch_interval: "1d"       # what we actually pull from yfinance
+  
 
-  # Session-anchored resampling — the Sunday-candle bug from the brainstorm.
-  # FX opens ~22:00 UTC Sunday (5PM EST), producing a partial first candle.
-  # Naive 4H binning without an explicit anchor drifts week to week, silently
-  # misaligning every LinReg/ADX/CSI calculation. Anchoring resample() to a
-  # fixed UTC origin (00:00) keeps 4H boundaries consistent every week,
-  # regardless of where the partial Sunday-open candle falls.
-  resample_origin_utc: "00:00"
-
-# NOTE: no `filters` section — Stage 1 filtering (min_avg_volume, min_price)
-# doesn't apply to FX. No such thing as meaningful "volume" for a
-# decentralized OTC market, and price LEVEL is an arbitrary quoting
-# convention (1.08 for EURUSD, 150 for USDJPY) — not a liquidity signal.
-# With a fixed 28-pair universe, there's also no funnel needed at all —
-# every pair gets scanned directly.
+  
 
 linreg:
   # NEEDS YOUR CONFIRMATION — this is a genuine design decision, not a
@@ -68,7 +55,7 @@ ml:
   # NEEDS YOUR CONFIRMATION — proposed: 30 4H-candles ≈ 5 trading days
   # (~1 week) forward. Shorter horizon than the daily project's 60
   # (≈3 months), matching the faster pace of a 4H timeframe.
-  label_forward_periods: 60
+  label_forward_periods: 15
   min_training_samples: 50
   model_retrain_days: 7
   backfill_stride: 1
@@ -95,8 +82,7 @@ scheduler:
   # underlying market information.
   run_times:
   - "00:00"
-  - "12:00"
-  - "20:00"
+  
   timezone: "UTC"
 
 smc:
@@ -170,7 +156,7 @@ csi:
   # 50 4H-candles ≈ 8 trading days — long enough to establish a
   # meaningful rolling mean/std for the z-score, short enough to stay
   # responsive to regime shifts.
-  zscore_window: 50
+  zscore_window: 30
   # csi_diff_roc — momentum/exhaustion on the RS gap itself: is it
   # accelerating or rolling over? Differenced over 2 4H-candles (~8
   # hours) — short enough to catch a genuine turn without being pure
@@ -185,7 +171,7 @@ atr:
   # price LEVEL isn't a meaningful unit here the way it loosely is for
   # stocks (JPY pairs quote in 2 decimals, others in 4-5).
   fast_period: 14
-  slow_period: 100
+  slow_period: 50
 
 candlestick:
   # Hammer / Shooting Star detection — hand-crafted interaction with
