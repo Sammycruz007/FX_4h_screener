@@ -129,11 +129,50 @@ def label_scanner_hits(
     if hits_with_linreg.empty:
         return pd.DataFrame()
 
+    # Normalise the merged 'datetime' column to TIMEZONE-NAIVE pandas
+    # Timestamps (UTC-interpreted, then tz stripped). THREE distinct
+    # failure modes were hit getting to this fix, not just one — worth
+    # recording all three since the underlying cause is a genuinely
+    # subtle pandas/numpy interop gotcha, not a simple typo:
+    #   1. str vs Timestamp entirely -> "'<' not supported between int
+    #      and str" (numpy compares Timestamps as ints internally)
+    #   2. tz-naive vs tz-aware Timestamp (pd.to_datetime() without
+    #      utc=True can silently parse a string with a '+00:00' offset
+    #      as tz-naive in some pandas paths) -> "can't compare
+    #      offset-naive and offset-aware datetimes"
+    #   3. THE ACTUAL ROOT CAUSE: calling .values on a tz-AWARE pandas
+    #      Series (as done below for price_dict's numpy arrays) SILENTLY
+    #      STRIPS the tz info, converting datetime64[us, UTC] to plain
+    #      datetime64[us] (tz-naive) numpy values — even though the
+    #      Series itself was correctly tz-aware right up until that
+    #      conversion. Meanwhile itertuples() (used for the per-row
+    #      loop below) preserves pandas' tz-aware Timestamp type. So the
+    #      array side silently goes tz-naive while the per-row needle
+    #      side stays tz-aware, and np.searchsorted fails on the same
+    #      "offset-naive and offset-aware" error as #2 — but this time
+    #      caused by a numpy conversion behaviour, not the earlier
+    #      to_datetime() call. Fix: interpret as UTC first (so any
+    #      offset in the input is correctly applied), THEN strip
+    #      tz-awareness explicitly with tz_localize(None) — applied
+    #      identically to both the price array and the per-row needle,
+    #      so neither side silently drifts tz-aware/tz-naive relative
+    #      to the other after any pandas/numpy conversion downstream.
+    hits_with_linreg["datetime"] = (
+        pd.to_datetime(hits_with_linreg["datetime"], utc=True).dt.tz_localize(None)
+    )
+
     # 2. PRE-PROCESS PRICES: group by pair into fast NumPy arrays
     logger.info("Pre-processing price data for fast lookup...")
     price_dict = {}
 
     sorted_prices = prices_df.sort_values(["pair", "datetime"]).reset_index(drop=True)
+    # Same UTC-interpret-then-strip-tz normalisation applied to the
+    # price side — see the detailed comment above for why both steps
+    # (utc=True AND tz_localize(None)) are both required, not either
+    # alone.
+    sorted_prices["datetime"] = (
+        pd.to_datetime(sorted_prices["datetime"], utc=True).dt.tz_localize(None)
+    )
 
     for pair, group in sorted_prices.groupby("pair"):
         price_dict[pair] = {
@@ -157,7 +196,9 @@ def label_scanner_hits(
         p_datetimes = price_dict[pair]["datetimes"]
         p_closes    = price_dict[pair]["closes"]
 
-        # O(log n) lookup for the datetime index
+        # O(log n) lookup for the datetime index — both p_datetimes and
+        # dt are now guaranteed-comparable pandas Timestamps (via the
+        # normalisation above), not a str-vs-Timestamp mismatch.
         idx = np.searchsorted(p_datetimes, dt, side="right")
 
         # Slice the next FORWARD_PERIODS candles directly from the array
