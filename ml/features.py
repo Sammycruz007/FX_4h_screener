@@ -342,6 +342,41 @@ def compute_signal_features(
     Returns:
         Dict of all features or None if insufficient data
     """
+    # ── Normalise datetime types before ANY comparison ──────────────────────
+    # CRITICAL BUG FIXED HERE: indicators_df['datetime'] can be a raw
+    # STRING (e.g. train_models.py's backfill_pair stores
+    # dt = str(df.iloc[i]["datetime"])), while signal_datetime (passed
+    # in from labels_df, i.e. labeller.label_scanner_hits' output) is a
+    # genuine tz-naive pandas Timestamp after that module's own dtype
+    # fix. A Timestamp == string comparison does NOT raise an error —
+    # it silently evaluates to False for every row, with no exception
+    # anywhere. That meant ind_row below was empty for every single
+    # call, every row returned None, and build_signal_feature_matrix
+    # logged "Rows: 0 | Failed: 21613" with no indication of why. Same
+    # underlying class of bug as the one already fixed in
+    # ml/labeller.py (mismatched datetime representations between
+    # files), just resurfacing here in a THIRD location. Normalising
+    # explicitly at the top of this function — rather than trusting
+    # every caller across the codebase to agree on a datetime format —
+    # closes off this whole class of bug for this function specifically.
+    signal_datetime = pd.Timestamp(signal_datetime)
+    if signal_datetime.tzinfo is not None:
+        signal_datetime = signal_datetime.tz_localize(None)
+
+    if not pd.api.types.is_datetime64_any_dtype(indicators_df["datetime"]):
+        indicators_df = indicators_df.copy()
+        indicators_df["datetime"] = pd.to_datetime(indicators_df["datetime"], utc=True).dt.tz_localize(None)
+    elif isinstance(indicators_df["datetime"].dtype, pd.DatetimeTZDtype):
+        indicators_df = indicators_df.copy()
+        indicators_df["datetime"] = indicators_df["datetime"].dt.tz_localize(None)
+
+    if not pd.api.types.is_datetime64_any_dtype(prices_df["datetime"]):
+        prices_df = prices_df.copy()
+        prices_df["datetime"] = pd.to_datetime(prices_df["datetime"], utc=True).dt.tz_localize(None)
+    elif isinstance(prices_df["datetime"].dtype, pd.DatetimeTZDtype):
+        prices_df = prices_df.copy()
+        prices_df["datetime"] = prices_df["datetime"].dt.tz_localize(None)
+
     # ── Get indicator row for this pair on signal datetime ────────────────
     ind_row = indicators_df[
         (indicators_df["pair"]     == pair) &
@@ -571,6 +606,38 @@ def build_signal_feature_matrix(
             "csi_rs and csi_commodity_bloc will be 0.0 for all training examples"
         )
 
+    # ── Normalise ALL datetime columns ONCE, here, before the loop ─────────
+    # CRITICAL BUG FIXED HERE (was previously silent): indicators_df's
+    # 'datetime' can be a raw STRING (train_models.py's backfill_pair
+    # stores dt = str(...)), while labels_df's 'datetime' (from
+    # labeller.label_scanner_hits) is a genuine tz-naive Timestamp.
+    # 'Timestamp == string' does NOT raise — it silently evaluates to
+    # False for every row, so ind_row was empty on every call and
+    # compute_signal_features returned None for all 21,613 rows with no
+    # exception anywhere to point at the cause. csi_series_df has the
+    # same risk (built from tz-aware aligned data in engines/csi.py,
+    # compared against tz-naive dt from labels_df). Normalising all
+    # three DataFrames here — ONCE, before the loop — fixes the bug AND
+    # avoids the alternative of re-normalising indicators_df/prices_df
+    # on every single one of 21,613+ per-row calls to
+    # compute_signal_features, which would be correct but wasteful at
+    # this scale.
+    def _normalise_dt(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty or "datetime" not in df.columns:
+            return df
+        df = df.copy()
+        if not pd.api.types.is_datetime64_any_dtype(df["datetime"]):
+            df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_localize(None)
+        elif isinstance(df["datetime"].dtype, pd.DatetimeTZDtype):
+            df["datetime"] = df["datetime"].dt.tz_localize(None)
+        return df
+
+    indicators_df = _normalise_dt(indicators_df)
+    prices_df     = _normalise_dt(prices_df)
+    labels_df     = _normalise_dt(labels_df)
+    if csi_series_df is not None and not csi_series_df.empty:
+        csi_series_df = _normalise_dt(csi_series_df)
+
     rows   = []
     failed = 0
 
@@ -591,7 +658,9 @@ def build_signal_feature_matrix(
 
         # Slice this signal datetime's CSI snapshot from the pre-computed
         # full series (CSI is cross-pair, so we don't recompute it here —
-        # same reasoning as compute_signal_features' csi_df parameter)
+        # same reasoning as compute_signal_features' csi_df parameter).
+        # dt and csi_series_df['datetime'] are both normalised above, so
+        # this equality check is now reliable rather than silently empty.
         csi_snapshot = None
         if csi_series_df is not None and not csi_series_df.empty:
             csi_snapshot = csi_series_df[csi_series_df["datetime"] == dt]
