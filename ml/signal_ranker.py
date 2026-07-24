@@ -116,7 +116,7 @@ MODEL_PATH = MODEL_DIR / "signal_ranker.pkl"
 # (200 4H-candles) candles — this is read live from config, not
 # hardcoded, so a future config change to linreg.period automatically
 # widens this gap too.
-SAFETY_GAP = GAP+1
+SAFETY_GAP = GAP+10
 
 
 # =============================================================================
