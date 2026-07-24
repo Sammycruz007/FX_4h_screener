@@ -1,4 +1,3 @@
-```python
 """
 data/fetcher.py
 ---------------
@@ -617,4 +616,3 @@ def run_data_pipeline() -> dict:
         logger.critical(f"FX data pipeline failed: {e}", exc_info=True)
         raise
 
-```
