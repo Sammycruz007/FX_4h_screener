@@ -161,7 +161,7 @@ csi:
   # accelerating or rolling over? Differenced over 2 4H-candles (~8
   # hours) — short enough to catch a genuine turn without being pure
   # single-candle noise.
-  roc_lag: 3
+  roc_lag: 5
 
 atr:
   # Two ATR periods, per your request — ATR_14/ATR_100 as a volatility-
