@@ -254,6 +254,7 @@ def fetch_single_pair(
     ticker     : str,
     start_date : str,
     end_date   : str,
+    min_rows   : int = 50,
 ) -> Optional[pd.DataFrame]:
     """
     Fetch 1H OHLC data for a single FX pair via yfinance, then resample
@@ -281,6 +282,19 @@ def fetch_single_pair(
         ticker    : yfinance FX ticker, e.g. "EURUSD=X"
         start_date: Start date string YYYY-MM-DD
         end_date  : End date string YYYY-MM-DD
+        min_rows  : Minimum resampled 4H row count to pass validation —
+                    MUST reflect whether this call is part of a full or
+                    incremental fetch (see validate_dataframe's
+                    docstring in utils/error_handler.py for the exact
+                    bug this guards against: a full-history fetch
+                    needs hundreds of rows to be meaningful, but an
+                    incremental fetch is CORRECTLY only a handful of
+                    rows by design — using one fixed floor for both
+                    modes silently rejects every incremental fetch,
+                    every run, once a pair transitions from full to
+                    incremental status. Callers (smart_fetch) pass the
+                    correct value per mode — this default of 50 is
+                    only a safety fallback, not meant to be relied on.
 
     Returns:
         Clean 4H OHLC DataFrame (columns: pair, datetime, open, high,
@@ -334,8 +348,12 @@ def fetch_single_pair(
         resampled["datetime"] = resampled.index
         resampled             = resampled.reset_index(drop=True)
 
-        # Validate
-        if not validate_dataframe(resampled, pair_name, required):
+        # Validate — min_rows MUST match fetch mode (full vs incremental),
+        # passed down from smart_fetch via fetch_universe/fetch_batch.
+        # See this function's Args docstring and validate_dataframe's own
+        # docstring in utils/error_handler.py for why a single fixed
+        # floor across both modes is a real, previously-hit bug.
+        if not validate_dataframe(resampled, pair_name, required, min_rows=min_rows):
             return None
 
         # Drop rows with null OHLC or non-positive close
@@ -360,6 +378,7 @@ def fetch_batch(
     tickers    : list[str],
     start_date : str,
     end_date   : str,
+    min_rows   : int = 50,
 ) -> pd.DataFrame:
     """
     Fetch 4H (resampled) OHLC data for a batch of pairs in parallel.
@@ -374,6 +393,9 @@ def fetch_batch(
         tickers   : List of yfinance FX tickers
         start_date: Start date string YYYY-MM-DD
         end_date  : End date string YYYY-MM-DD
+        min_rows  : Passed through to fetch_single_pair's validation —
+                    MUST reflect full vs incremental fetch mode (see
+                    fetch_single_pair's docstring)
 
     Returns:
         Combined DataFrame for all successful pairs in batch
@@ -383,7 +405,7 @@ def fetch_batch(
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_ticker = {
-            executor.submit(fetch_single_pair, ticker, start_date, end_date): ticker
+            executor.submit(fetch_single_pair, ticker, start_date, end_date, min_rows): ticker
             for ticker in tickers
         }
 
@@ -417,6 +439,7 @@ def fetch_universe(
     tickers    : list[str],
     start_date : str,
     end_date   : str,
+    min_rows   : int = 50,
 ) -> pd.DataFrame:
     """
     Fetch 4H (resampled from 1H) OHLC data for the entire FX universe in
@@ -436,6 +459,12 @@ def fetch_universe(
         tickers   : Full list of yfinance FX tickers
         start_date: Start date YYYY-MM-DD
         end_date  : End date YYYY-MM-DD
+        min_rows  : Passed through to fetch_batch/fetch_single_pair's
+                    validation — MUST reflect full vs incremental fetch
+                    mode (see fetch_single_pair's docstring). smart_fetch
+                    is the only caller that should decide this value;
+                    it calls fetch_universe once per mode with the
+                    correct min_rows each time.
 
     Returns:
         Combined DataFrame for all pairs
@@ -451,12 +480,13 @@ def fetch_universe(
         f"Fetching {total} FX pairs | "
         f"{len(batches)} batch(es) of up to {BATCH_SIZE} | "
         f"Period: {start_date} to {end_date} | "
-        f"Interval: {FETCH_INTERVAL} -> resampled to {RESAMPLE_INTERVAL}"
+        f"Interval: {FETCH_INTERVAL} -> resampled to {RESAMPLE_INTERVAL} | "
+        f"min_rows: {min_rows}"
     )
 
     for i, batch in enumerate(batches, 1):
         logger.info(f"Batch {i}/{len(batches)} | {len(batch)} pairs")
-        batch_df = fetch_batch(batch, start_date, end_date)
+        batch_df = fetch_batch(batch, start_date, end_date, min_rows)
 
         if not batch_df.empty:
             all_data.append(batch_df)
@@ -548,25 +578,47 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
     all_data = []
 
     # ── Full historical fetch ───────────────────────────────────────────────
+    # min_rows here is a real floor — a full-history fetch spanning up to
+    # HISTORICAL_DAYS (729) days of 1H data, resampled to 4H (~6
+    # candles/day), should produce hundreds of rows. A handful of rows
+    # coming back from what's supposed to be a full backfill signals a
+    # real fetch problem (e.g. yfinance returned almost nothing), not a
+    # legitimate small result — so a meaningfully higher floor than the
+    # incremental branch below is correct here, not just a leftover default.
+    FULL_FETCH_MIN_ROWS = 50
+
     if full_tickers:
         start_full = (
             today - timedelta(days=HISTORICAL_DAYS)
         ).strftime("%Y-%m-%d")
 
         logger.info(f"Full fetch: {start_full} to {end_date}")
-        df_full = fetch_universe(full_tickers, start_full, end_date)
+        df_full = fetch_universe(full_tickers, start_full, end_date, min_rows=FULL_FETCH_MIN_ROWS)
 
         if not df_full.empty:
             all_data.append(df_full)
 
     # ── Incremental fetch ────────────────────────────────────────────────────
+    # CRITICAL: min_rows must be small here — this is the exact bug
+    # documented in utils/error_handler.py's validate_dataframe docstring.
+    # An incremental fetch (INCREMENTAL_DAYS=10 window) is CORRECTLY only
+    # a handful of rows by design, especially right after a weekend/holiday
+    # gap or for a pair that just transitioned from full to incremental
+    # status with barely any new candles yet. Using the full-fetch floor
+    # here would silently reject every legitimate incremental fetch, every
+    # run, once most of the universe has transitioned off full-fetch status
+    # — described in that docstring as having caused a near-total pipeline
+    # failure in the stock project. 1 means "at least one new candle
+    # exists" — the minimum meaningful bar for an incremental result.
+    INCREMENTAL_FETCH_MIN_ROWS = 1
+
     if incremental_tickers:
         start_incr = (
             today - timedelta(days=INCREMENTAL_DAYS)
         ).strftime("%Y-%m-%d")
 
         logger.info(f"Incremental fetch: {start_incr} to {end_date}")
-        df_incr = fetch_universe(incremental_tickers, start_incr, end_date)
+        df_incr = fetch_universe(incremental_tickers, start_incr, end_date, min_rows=INCREMENTAL_FETCH_MIN_ROWS)
 
         if not df_incr.empty:
             all_data.append(df_incr)
