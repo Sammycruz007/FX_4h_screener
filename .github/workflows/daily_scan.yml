@@ -37,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements-cloud.txt
+          pip install -r requirements_cloud.txt
 
       # ── 4. Run daily pipeline ─────────────────────────────────────────────
       - name: Run Eagle Logic pipeline
