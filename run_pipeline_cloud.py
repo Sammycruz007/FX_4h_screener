@@ -79,7 +79,7 @@ from data.database_cloud import (
     write_indicator_results,
     write_scan_results,
 )
-from data.storage_cloud import write_snapshot, consolidate_snapshots
+from data.storage_cloud import write_snapshot, consolidate_snapshots, read_price_history
 
 from engines.linreg import compute_linreg_latest
 from engines.smc    import compute_smc
@@ -196,13 +196,50 @@ def run_full_pipeline():
     except Exception as e:
         logger.warning(f"Consolidation raised an exception: {e} — continuing")
 
-    # ── STEP 6: Reshape long-form fetch output into per-pair dict ───────────
+    # ── STEP 3.6: Read back the FULL consolidated history for engines ───────
+    # CRITICAL FIX: raw_df (from STEP 3) is deliberately tiny on every run
+    # after the first — smart_fetch's whole design is to fetch only NEW
+    # candles incrementally (see fetcher.py's docstring), not the full
+    # history every time. But every downstream engine (LinReg needs
+    # 2xLINREG_PERIOD=400+ rows, SMC/ADX/CSI all need substantial
+    # history too) needs the FULL accumulated window, not just this
+    # run's delta. STEP 3.5 already consolidated the complete history
+    # into Storage — this step reads it back so engines operate on the
+    # real, full dataset rather than on raw_df's few dozen rows per pair.
+    # This was a real bug: the first-ever run (full 729-day fetch)
+    # happened to have raw_df == the full history, masking the problem
+    # until the second run's incremental fetch made every engine starve
+    # for data and the whole pipeline abort with "No indicator rows
+    # computed for any pair."
+    logger.info("\n[STEP 3.6] Reading back full consolidated history for engines...")
+    try:
+        working_df = read_price_history()
+        if working_df.empty:
+            logger.warning(
+                "read_price_history returned empty after consolidation — "
+                "falling back to this run's raw_df (may be too small for "
+                "some engines, e.g. LinReg, on anything but a first-ever run)"
+            )
+            working_df = raw_df
+        else:
+            logger.info(
+                f"Loaded {len(working_df)} rows of full history for "
+                f"{working_df['pair'].nunique()} pairs"
+            )
+    except Exception as e:
+        logger.warning(
+            f"read_price_history failed: {e} — falling back to this run's "
+            f"raw_df (may be too small for some engines)"
+        )
+        working_df = raw_df
+
+    # ── STEP 6: Reshape long-form history into per-pair dict ────────────────
     # (Numbered to match the stock project's step numbering where the
     # analogous "load price data for engines" step lived — Stage 1/
     # sector steps 4-5 don't exist for FX, so this is the next real step.)
     logger.info("\n[STEP 6] Reshaping price data for indicator engines...")
     try:
-        tickers_data = to_pair_dict(raw_df)
+        tickers_data = to_pair_dict(working_df)
         if not tickers_data:
             logger.error("to_pair_dict produced an empty dict. Aborting.")
             return
@@ -387,7 +424,7 @@ def run_full_pipeline():
 
         scored_df = score_candidates(
             candidates_df   = candidates_df,
-            prices_df       = raw_df,
+            prices_df       = working_df,
             indicators_df   = indicator_df,
             csi_df          = csi_df,
             signal_datetime = scan_datetime,
