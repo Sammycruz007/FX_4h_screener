@@ -12,7 +12,7 @@ storage:
   # 913 days ≈ 2.5 years — sized deliberately: 28 pairs × ~6 4H-candles/
   # day × 913 days ≈ 153K rows steady-state, comfortably under the
   # free-tier 1GB cap even before accounting for Parquet compression.
-  retention_days: 5100
+  retention_days: 730
 
 fetcher:
   batch_size: 25
@@ -24,9 +24,9 @@ fetcher:
   # config (correct for the daily-stocks project, WRONG here — would have
   # silently failed/truncated on the very first fetch). 729 leaves a
   # 1-day safety buffer under the actual limit.
-  historical_days: 5000
+  historical_days: 729
   incremental_days: 10       # buffer for weekend/holiday gaps
-  fetch_interval: "1d"       # what we actually pull from yfinance
+  fetch_interval: "1h"       # what we actually pull from yfinance
   
 
   
@@ -38,7 +38,7 @@ linreg:
   # trading day → ~33 trading days). Shorter than "250 daily = ~1 year"
   # by design — a 4H regression channel spanning a full year would be
   # extremely wide and likely useless for spotting swing extremes.
-  period: 250
+  period: 450
   std_devs:
   - 1
   - 2
@@ -55,7 +55,7 @@ ml:
   # NEEDS YOUR CONFIRMATION — proposed: 30 4H-candles ≈ 5 trading days
   # (~1 week) forward. Shorter horizon than the daily project's 60
   # (≈3 months), matching the faster pace of a 4H timeframe.
-  label_forward_periods: 15
+  label_forward_periods: 50
   min_training_samples: 50
   model_retrain_days: 7
   backfill_stride: 1
@@ -156,7 +156,7 @@ csi:
   # 50 4H-candles ≈ 8 trading days — long enough to establish a
   # meaningful rolling mean/std for the z-score, short enough to stay
   # responsive to regime shifts.
-  zscore_window: 30
+  zscore_window: 24
   # csi_diff_roc — momentum/exhaustion on the RS gap itself: is it
   # accelerating or rolling over? Differenced over 2 4H-candles (~8
   # hours) — short enough to catch a genuine turn without being pure
