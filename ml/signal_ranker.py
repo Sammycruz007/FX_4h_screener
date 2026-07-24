@@ -307,7 +307,7 @@ def train_signal_ranker(
     pipeline.fit(X_train, y_train)
 
     y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
-    y_pred       = (y_pred_proba >= 0.65).astype(int)
+    y_pred       = (y_pred_proba >= 0.60).astype(int)
     logger.info(
         f"OOS Probability Spread | "
         f"Max: {y_pred_proba.max():.4f} | Mean: {y_pred_proba.mean():.4f}"
