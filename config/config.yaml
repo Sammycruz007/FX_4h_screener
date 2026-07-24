@@ -51,7 +51,7 @@ linreg:
   # trading day → ~33 trading days). Shorter than "250 daily = ~1 year"
   # by design — a 4H regression channel spanning a full year would be
   # extremely wide and likely useless for spotting swing extremes.
-  period: 200
+  period: 400
   std_devs:
   - 1
   - 2
@@ -94,6 +94,7 @@ scheduler:
   # sit ~8 hours apart so the two scans aren't clustered on the same
   # underlying market information.
   run_times:
+  - "00:00"
   - "12:00"
   - "20:00"
   timezone: "UTC"
@@ -174,7 +175,7 @@ csi:
   # accelerating or rolling over? Differenced over 2 4H-candles (~8
   # hours) — short enough to catch a genuine turn without being pure
   # single-candle noise.
-  roc_lag: 2
+  roc_lag: 3
 
 atr:
   # Two ATR periods, per your request — ATR_14/ATR_100 as a volatility-
