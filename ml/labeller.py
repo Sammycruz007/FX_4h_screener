@@ -118,7 +118,71 @@ def label_scanner_hits(
         logger.warning("Signal Ranker labeller: No scan hits provided")
         return pd.DataFrame()
 
+    def _normalise_datetime_column(df: pd.DataFrame, label: str) -> pd.DataFrame:
+        """
+        Coerce a DataFrame's 'datetime' column to timezone-naive pandas
+        Timestamps (UTC-interpreted, then tz stripped), defensively.
+
+        WHY THIS EXISTS, AND WHY IT RUNS BEFORE THE MERGE (not after):
+        this function was originally applied only to hits_with_linreg
+        AFTER the merge below. That's a real gap — if scan_hits_df's
+        and indicators_df's 'datetime' columns have ANY subtle
+        inconsistency between them BEFORE the merge (different string
+        precision, one already a Timestamp and the other a string,
+        etc.), pd.merge's exact-match join can silently produce zero
+        or wrong matches — a merge that already went wrong can't be
+        fixed by normalising its output afterward. Normalising each
+        input independently, before the merge, closes off that whole
+        class of failure, not just the searchsorted-level symptom of
+        it.
+
+        GUARD AGAINST SILENT MISINTERPRETATION: pd.to_datetime on a
+        raw numeric (int/float) column does NOT raise an error — it
+        silently interprets the numbers as Unix EPOCH SECONDS by
+        default, producing a wildly wrong date (e.g. year 1970) rather
+        than failing loudly. If a 'datetime' column ever arrives as
+        raw nanosecond-since-epoch integers (a real risk after a
+        Parquet round-trip through Supabase Storage, depending on
+        pyarrow's schema handling), this would silently corrupt every
+        label rather than crash — a much worse failure mode than an
+        exception. We explicitly detect and reject raw numeric input
+        here instead of letting pd.to_datetime guess.
+
+        Args:
+            df   : DataFrame with a 'datetime' column to normalise IN PLACE
+            label: Name for this DataFrame, used only in the error
+                   message if the numeric-input guard fires
+
+        Returns:
+            The same DataFrame, with 'datetime' coerced to tz-naive
+            Timestamps
+        """
+        col = df["datetime"]
+
+        if pd.api.types.is_numeric_dtype(col):
+            raise MLError(
+                f"{label}['datetime'] is numeric (dtype={col.dtype}) — "
+                f"refusing to guess whether these are epoch seconds, "
+                f"milliseconds, or nanoseconds. pd.to_datetime's default "
+                f"epoch-seconds assumption would silently produce wrong "
+                f"dates rather than fail loudly. This usually means a "
+                f"datetime column lost its proper dtype somewhere "
+                f"upstream (e.g. a Parquet round-trip) — fix the source, "
+                f"don't guess the unit here."
+            )
+
+        df = df.copy()
+        df["datetime"] = pd.to_datetime(col, utc=True).dt.tz_localize(None)
+        return df
+
+    scan_hits_df  = _normalise_datetime_column(scan_hits_df, "scan_hits_df")
+    indicators_df = _normalise_datetime_column(indicators_df, "indicators_df")
+
     # 1. BULK LOOKUP: merge indicators to get the fixed LinReg value in one shot
+    # Both sides are now guaranteed-normalised BEFORE this merge — closing
+    # off the risk of a silent zero/partial-match merge from any type
+    # inconsistency between the two inputs (see _normalise_datetime_column's
+    # docstring for why this matters more than fixing it after the fact).
     hits_with_linreg = pd.merge(
         scan_hits_df,
         indicators_df[["pair", "datetime", "linreg_value"]],
@@ -129,54 +193,23 @@ def label_scanner_hits(
     if hits_with_linreg.empty:
         return pd.DataFrame()
 
-    # Normalise the merged 'datetime' column to TIMEZONE-NAIVE pandas
-    # Timestamps (UTC-interpreted, then tz stripped). THREE distinct
-    # failure modes were hit getting to this fix, not just one — worth
-    # recording all three since the underlying cause is a genuinely
-    # subtle pandas/numpy interop gotcha, not a simple typo:
-    #   1. str vs Timestamp entirely -> "'<' not supported between int
-    #      and str" (numpy compares Timestamps as ints internally)
-    #   2. tz-naive vs tz-aware Timestamp (pd.to_datetime() without
-    #      utc=True can silently parse a string with a '+00:00' offset
-    #      as tz-naive in some pandas paths) -> "can't compare
-    #      offset-naive and offset-aware datetimes"
-    #   3. THE ACTUAL ROOT CAUSE: calling .values on a tz-AWARE pandas
-    #      Series (as done below for price_dict's numpy arrays) SILENTLY
-    #      STRIPS the tz info, converting datetime64[us, UTC] to plain
-    #      datetime64[us] (tz-naive) numpy values — even though the
-    #      Series itself was correctly tz-aware right up until that
-    #      conversion. Meanwhile itertuples() (used for the per-row
-    #      loop below) preserves pandas' tz-aware Timestamp type. So the
-    #      array side silently goes tz-naive while the per-row needle
-    #      side stays tz-aware, and np.searchsorted fails on the same
-    #      "offset-naive and offset-aware" error as #2 — but this time
-    #      caused by a numpy conversion behaviour, not the earlier
-    #      to_datetime() call. Fix: interpret as UTC first (so any
-    #      offset in the input is correctly applied), THEN strip
-    #      tz-awareness explicitly with tz_localize(None) — applied
-    #      identically to both the price array and the per-row needle,
-    #      so neither side silently drifts tz-aware/tz-naive relative
-    #      to the other after any pandas/numpy conversion downstream.
-    hits_with_linreg["datetime"] = (
-        pd.to_datetime(hits_with_linreg["datetime"], utc=True).dt.tz_localize(None)
-    )
-
     # 2. PRE-PROCESS PRICES: group by pair into fast NumPy arrays
     logger.info("Pre-processing price data for fast lookup...")
     price_dict = {}
 
+    prices_df = _normalise_datetime_column(prices_df, "prices_df")
     sorted_prices = prices_df.sort_values(["pair", "datetime"]).reset_index(drop=True)
-    # Same UTC-interpret-then-strip-tz normalisation applied to the
-    # price side — see the detailed comment above for why both steps
-    # (utc=True AND tz_localize(None)) are both required, not either
-    # alone.
-    sorted_prices["datetime"] = (
-        pd.to_datetime(sorted_prices["datetime"], utc=True).dt.tz_localize(None)
-    )
 
     for pair, group in sorted_prices.groupby("pair"):
+        # .to_numpy(dtype="datetime64[ns]") rather than the bare .values
+        # used previously — .values on a tz-aware Series silently
+        # strips tz info in a way that's easy to lose track of (see the
+        # historical note below); an explicit target dtype makes the
+        # array's actual representation unambiguous at the point it's
+        # built, rather than relying on whatever .values happens to
+        # infer.
         price_dict[pair] = {
-            "datetimes": group["datetime"].values,
+            "datetimes": group["datetime"].to_numpy(dtype="datetime64[ns]"),
             "closes"   : group["close"].values,
         }
 
@@ -196,10 +229,23 @@ def label_scanner_hits(
         p_datetimes = price_dict[pair]["datetimes"]
         p_closes    = price_dict[pair]["closes"]
 
-        # O(log n) lookup for the datetime index — both p_datetimes and
-        # dt are now guaranteed-comparable pandas Timestamps (via the
-        # normalisation above), not a str-vs-Timestamp mismatch.
-        idx = np.searchsorted(p_datetimes, dt, side="right")
+        # O(log n) lookup for the datetime index.
+        #
+        # THE ACTUAL ROOT CAUSE (numpy 2.x, confirmed by reproducing the
+        # exact production error locally): p_datetimes is a genuine
+        # numpy datetime64[ns] array and dt is a genuine pandas.Timestamp
+        # — both individually correct, tz-naive, same precision — yet
+        # numpy 2.x's searchsorted no longer implicitly coerces a
+        # pandas.Timestamp needle against a datetime64 array the way
+        # earlier numpy versions did, and fails with the exact
+        # "'<' not supported between instances of 'int' and 'Timestamp'"
+        # error seen in production. This was NOT the tz-awareness bug
+        # fixed earlier (that was real too, but a different, now-closed
+        # issue) — this is a distinct numpy-version compatibility gap.
+        # Explicitly converting the needle to np.datetime64 removes any
+        # ambiguity about what numpy should coerce, and works
+        # identically across numpy versions.
+        idx = np.searchsorted(p_datetimes, np.datetime64(dt), side="right")
 
         # Slice the next FORWARD_PERIODS candles directly from the array
         future_closes = p_closes[idx : idx + FORWARD_PERIODS]
