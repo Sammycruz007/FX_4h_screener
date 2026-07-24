@@ -24,7 +24,7 @@ fetcher:
   # config (correct for the daily-stocks project, WRONG here — would have
   # silently failed/truncated on the very first fetch). 729 leaves a
   # 1-day safety buffer under the actual limit.
-  historical_days: 3000
+  historical_days: 4500
   incremental_days: 10       # buffer for weekend/holiday gaps
   fetch_interval: "1d"       # what we actually pull from yfinance
   
