@@ -307,7 +307,7 @@ def train_signal_ranker(
     pipeline.fit(X_train, y_train)
 
     y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
-    y_pred       = (y_pred_proba >= 0.50).astype(int)
+    y_pred       = (y_pred_proba >= 0.60).astype(int)
     logger.info(
         f"OOS Probability Spread | "
         f"Max: {y_pred_proba.max():.4f} | Mean: {y_pred_proba.mean():.4f}"
@@ -324,14 +324,14 @@ def train_signal_ranker(
         f"F1: {f1:.4f} | AUC-ROC: {auc_roc:.4f} | PR-AUC: {pr_auc:.4f}"
     )
 
-    # ── Precision at top 5% of signals — a real-trading-relevant metric ─────
+    # ── Precision at top 2% of signals — a real-trading-relevant metric ─────
     results_df = pd.DataFrame({
         "true_label" : y_test,
         "probability": y_pred_proba,
     }).sort_values("probability", ascending=False)
 
-    top_5_percent_cutoff = max(1, int(len(results_df) * 0.05))
-    top_signals          = results_df.head(top_5_percent_cutoff)
+    top_5_percent_cutoff = max(1, int(len(results_df) * 0.02))
+    top_signals          = results_df.head(top_2_percent_cutoff)
     top_precision        = top_signals["true_label"].mean()
 
     logger.info(
