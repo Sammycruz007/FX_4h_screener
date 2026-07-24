@@ -69,8 +69,8 @@ import plotly.graph_objects as go
 # throws StreamlitAPIException and masks the real secrets error underneath.
 # =============================================================================
 
-SYSTEM_NAME = "FX Scanner"
-SYSTEM_ICON = "💱"
+SYSTEM_NAME = "Eagle Logic FX System"
+SYSTEM_ICON = "🦅"
 
 st.set_page_config(
     page_title = SYSTEM_NAME,
