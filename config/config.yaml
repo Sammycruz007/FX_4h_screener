@@ -51,11 +51,11 @@ logging:
   max_file_size_mb: 10
 
 ml:
-  high_probability_threshold: 0.65
+  high_probability_threshold: 0.60
   # NEEDS YOUR CONFIRMATION — proposed: 30 4H-candles ≈ 5 trading days
   # (~1 week) forward. Shorter horizon than the daily project's 60
   # (≈3 months), matching the faster pace of a 4H timeframe.
-  label_forward_periods: 60
+  label_forward_periods: 15
   min_training_samples: 50
   model_retrain_days: 7
   backfill_stride: 1
