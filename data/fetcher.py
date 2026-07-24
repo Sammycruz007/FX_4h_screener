@@ -1,3 +1,4 @@
+```python
 """
 data/fetcher.py
 ---------------
@@ -13,29 +14,10 @@ UNIVERSE SOURCING (fixed, not discovered):
    `universe.pairs` gets fetched and scanned directly. The universe comes
    straight from config, not from any external source.
 
-FETCH INTERVAL vs. COMPUTE INTERVAL (the core FX-specific change):
-   yfinance does not offer a native 4H interval. We fetch 1H data (yfinance's
-   finest granularity that supports multi-year history) and resample it to
-   4H ourselves. All downstream indicators (LinReg, SMC, ADX, CSI, ATR,
-   candlestick) are computed on the RESAMPLED 4H series, never on raw 1H.
-
-   CRITICAL yfinance CEILING: 1H (60m) history is capped at 730 calendar
-   days — unlike daily candles, which have no such cap. `historical_days`
-   in config.yaml is 729 (a 1-day safety buffer under the real limit), not
-   the 1800 carried over from the daily-stocks project. Requesting more
-   than ~730 days of 1H data silently truncates or fails at the yfinance
-   layer, not with a clean error — this was caught before it could bite us
-   in production and must never be raised back toward 1800.
-
-SESSION-ANCHORED RESAMPLING (the Sunday-candle bug):
-   FX opens ~22:00 UTC Sunday (5PM EST) with a partial first candle. A
-   naive `.resample("4h")` without an explicit origin drifts its 4H
-   boundaries depending on where that partial candle falls, and the drift
-   compounds silently week to week — no crash, just quietly misaligned
-   LinReg/ADX/CSI values for the rest of the week. We anchor every
-   resample to a fixed UTC origin (00:00, from config `resample_origin_utc`)
-   so 4H boundaries land on the same wall-clock hours every week regardless
-   of the weekend gap: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC.
+FETCH INTERVAL (Daily):
+   We fetch native Daily (1D) data from yfinance. Unlike 1H data, daily data 
+   has no 730-day yfinance ceiling, allowing us to seamlessly fetch 8+ years 
+   of historical data in a single request. 
 
 WHAT'S DROPPED FROM THE STOCK PROJECT (deliberately, not oversight):
    - NASDAQ FTP universe discovery         → fixed 28-pair list from config
@@ -44,7 +26,7 @@ WHAT'S DROPPED FROM THE STOCK PROJECT (deliberately, not oversight):
    - `filters` / `indices` / `sectors` config sections → removed upstream
 
 SMART FETCH (unchanged in shape from the stock project):
-   First run  → full HISTORICAL_DAYS (729) of 1H history per pair
+   First run  → full HISTORICAL_DAYS of 1D history per pair
    Later runs → incremental INCREMENTAL_DAYS fetch for pairs already tracked
 
 PARALLEL BATCHING (unchanged in shape, smaller in scale):
@@ -114,20 +96,9 @@ BATCH_SIZE       = FETCHER_CFG["batch_size"]
 MAX_WORKERS      = FETCHER_CFG["max_workers"]
 RETRY_ATTEMPTS   = FETCHER_CFG["retry_attempts"]
 RETRY_DELAY      = FETCHER_CFG["retry_delay_seconds"]
-HISTORICAL_DAYS  = FETCHER_CFG["historical_days"]      # 729 — hard yfinance ceiling, see module docstring
+HISTORICAL_DAYS  = FETCHER_CFG["historical_days"]      
 INCREMENTAL_DAYS = FETCHER_CFG["incremental_days"]
-FETCH_INTERVAL   = FETCHER_CFG["fetch_interval"]        # "1h" — what we pull from yfinance
-RESAMPLE_INTERVAL = FETCHER_CFG["resample_interval"]    # "4h" — what we compute on
-RESAMPLE_ORIGIN_UTC = FETCHER_CFG["resample_origin_utc"]  # "00:00" — fixed anchor, see module docstring
-
-if HISTORICAL_DAYS > 729:
-    # This is not a style preference — yfinance silently truncates/fails
-    # 1H history beyond 730 calendar days. Refuse to run rather than let
-    # a future config edit quietly reintroduce the daily-project's 1800.
-    raise DataValidationError(
-        f"fetcher.historical_days={HISTORICAL_DAYS} exceeds yfinance's "
-        f"730-day ceiling for 1H (60m) data. Max safe value is 729."
-    )
+FETCH_INTERVAL   = FETCHER_CFG["fetch_interval"]        # "1d" — native daily bars
 
 
 # =============================================================================
@@ -169,80 +140,7 @@ def _strip_yf_suffix(ticker: str) -> str:
 
 
 # =============================================================================
-# SESSION-ANCHORED 4H RESAMPLING
-# The core FX-specific piece of this module. See module docstring for why
-# a naive resample() is a real, silent-corruption bug risk here.
-# =============================================================================
-
-def resample_to_4h(raw_1h: pd.DataFrame) -> pd.DataFrame:
-    """
-    Resample 1H OHLC data to session-anchored 4H candles.
-
-    FLOW:
-    1. Ensure the DataFrame is indexed by a UTC-aware DatetimeIndex
-       (yfinance returns tz-aware timestamps for FX; we normalize to UTC
-       explicitly rather than trust the source timezone implicitly)
-    2. Resample with `origin=RESAMPLE_ORIGIN_UTC` anchored to midnight UTC
-       of the data's own start day — this is what keeps 4H boundaries at
-       00:00/04:00/08:00/12:00/16:00/20:00 UTC every week, regardless of
-       where the Sunday partial-open candle falls
-    3. Aggregate OHLC with standard rules: first open, max high, min low,
-       last close
-    4. Drop any resulting 4H bars with all-NaN OHLC (can happen at the
-       very start/end of the input range where a bucket has zero 1H rows)
-
-    Args:
-        raw_1h: DataFrame with columns [open, high, low, close] and a
-                UTC DatetimeIndex, for a single pair
-
-    Returns:
-        DataFrame resampled to 4H, same columns, DatetimeIndex preserved
-    """
-    if raw_1h.empty:
-        return raw_1h
-
-    df = raw_1h.copy()
-
-    # ── Step 1: Force UTC-aware index ──────────────────────────────────────
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    else:
-        df.index = df.index.tz_convert("UTC")
-
-    # ── Step 2 & 3: Session-anchored resample ──────────────────────────────
-    # `origin="start_day"` combined with an explicit UTC-midnight-based
-    # offset is what pandas needs to anchor bucket edges to 00:00 UTC
-    # rather than to the first timestamp in the data (which drifts week
-    # to week given the partial Sunday-open candle). We pin the origin to
-    # midnight UTC of the first day in the data, which — combined with
-    # 4H being an exact divisor of 24H — guarantees every subsequent
-    # bucket edge is also exactly on a 00:00/04:00/.../20:00 UTC boundary,
-    # for the entire span, with no drift.
-    origin_ts = pd.Timestamp(
-        df.index[0].normalize().date().isoformat() + f"T{RESAMPLE_ORIGIN_UTC}:00",
-        tz="UTC",
-    )
-
-    ohlc = df.resample(
-        RESAMPLE_INTERVAL,
-        origin=origin_ts,
-        label="left",
-        closed="left",
-    ).agg({
-        "open" : "first",
-        "high" : "max",
-        "low"  : "min",
-        "close": "last",
-    })
-
-    # ── Step 4: Drop empty buckets ──────────────────────────────────────────
-    ohlc = ohlc.dropna(subset=["open", "high", "low", "close"], how="all")
-
-    return ohlc
-
-
-# =============================================================================
-# SINGLE PAIR OHLC FETCH (1H, pre-resample)
+# SINGLE PAIR OHLC FETCH (Daily)
 # =============================================================================
 
 @retry(
@@ -257,18 +155,17 @@ def fetch_single_pair(
     min_rows   : int = 50,
 ) -> Optional[pd.DataFrame]:
     """
-    Fetch 1H OHLC data for a single FX pair via yfinance, then resample
-    to 4H before returning.
+    Fetch Daily OHLC data for a single FX pair via yfinance.
 
     FLOW:
-    1. Download 1H OHLC from yfinance (no volume — see note below)
+    1. Download Daily OHLC from yfinance (no volume — see note below)
     2. Flatten MultiIndex columns if present
     3. Standardise column names to lowercase
-    4. Resample 1H → session-anchored 4H (resample_to_4h)
+    4. Force UTC timezone alignment on the index
     5. Add pair and datetime columns
     6. Validate data quality
     7. Drop nulls and non-positive prices
-    8. Return clean, 4H DataFrame
+    8. Return clean, Daily DataFrame
 
     NOTE ON VOLUME: FX is decentralized (OTC) — there is no real,
     centralized traded volume the way exchanges provide for stocks. What
@@ -282,22 +179,12 @@ def fetch_single_pair(
         ticker    : yfinance FX ticker, e.g. "EURUSD=X"
         start_date: Start date string YYYY-MM-DD
         end_date  : End date string YYYY-MM-DD
-        min_rows  : Minimum resampled 4H row count to pass validation —
+        min_rows  : Minimum row count to pass validation —
                     MUST reflect whether this call is part of a full or
-                    incremental fetch (see validate_dataframe's
-                    docstring in utils/error_handler.py for the exact
-                    bug this guards against: a full-history fetch
-                    needs hundreds of rows to be meaningful, but an
-                    incremental fetch is CORRECTLY only a handful of
-                    rows by design — using one fixed floor for both
-                    modes silently rejects every incremental fetch,
-                    every run, once a pair transitions from full to
-                    incremental status. Callers (smart_fetch) pass the
-                    correct value per mode — this default of 50 is
-                    only a safety fallback, not meant to be relied on.
+                    incremental fetch.
 
     Returns:
-        Clean 4H OHLC DataFrame (columns: pair, datetime, open, high,
+        Clean Daily OHLC DataFrame (columns: pair, datetime, open, high,
         low, close) or None if fetch/validation fails
     """
     local_session = curl_requests.Session(impersonate="chrome")
@@ -307,7 +194,7 @@ def fetch_single_pair(
             ticker,
             start       = start_date,
             end         = end_date,
-            interval    = FETCH_INTERVAL,   # "1h" — 4h not offered by yfinance
+            interval    = FETCH_INTERVAL,   
             auto_adjust = True,
             progress    = False,
             threads     = False,
@@ -334,37 +221,31 @@ def fetch_single_pair(
             logger.warning(f"{ticker} | Missing columns: {missing}")
             return None
 
-        raw = raw[required].copy()
-
-        # ── Resample 1H -> session-anchored 4H BEFORE anything else ────────
-        resampled = resample_to_4h(raw)
-
-        if resampled.empty:
-            logger.warning(f"{ticker} | Resample to 4H produced no rows")
-            return None
+        df = raw[required].copy()
+        
+        # Force UTC-aware index to standardize datetimes
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
 
         pair_name = _strip_yf_suffix(ticker)
-        resampled["pair"]     = pair_name
-        resampled["datetime"] = resampled.index
-        resampled             = resampled.reset_index(drop=True)
+        df["pair"]     = pair_name
+        df["datetime"] = df.index
+        df             = df.reset_index(drop=True)
 
-        # Validate — min_rows MUST match fetch mode (full vs incremental),
-        # passed down from smart_fetch via fetch_universe/fetch_batch.
-        # See this function's Args docstring and validate_dataframe's own
-        # docstring in utils/error_handler.py for why a single fixed
-        # floor across both modes is a real, previously-hit bug.
-        if not validate_dataframe(resampled, pair_name, required, min_rows=min_rows):
+        if not validate_dataframe(df, pair_name, required, min_rows=min_rows):
             return None
 
         # Drop rows with null OHLC or non-positive close
-        resampled = resampled.dropna(subset=required)
-        resampled = resampled[resampled["close"] > 0]
+        df = df.dropna(subset=required)
+        df = df[df["close"] > 0]
 
         logger.debug(
-            f"{ticker} | {len(resampled)} 4H rows (from 1H) | "
+            f"{ticker} | {len(df)} Daily rows | "
             f"{start_date} to {end_date}"
         )
-        return resampled
+        return df
 
     except Exception as e:
         raise DataFetchError(f"{ticker} fetch failed: {e}") from e
@@ -381,7 +262,7 @@ def fetch_batch(
     min_rows   : int = 50,
 ) -> pd.DataFrame:
     """
-    Fetch 4H (resampled) OHLC data for a batch of pairs in parallel.
+    Fetch Daily OHLC data for a batch of pairs in parallel.
 
     FLOW:
     1. Submit all pairs to ThreadPoolExecutor simultaneously
@@ -442,8 +323,7 @@ def fetch_universe(
     min_rows   : int = 50,
 ) -> pd.DataFrame:
     """
-    Fetch 4H (resampled from 1H) OHLC data for the entire FX universe in
-    batches.
+    Fetch Daily OHLC data for the entire FX universe in batches.
 
     FLOW:
     1. Split full ticker list into batches of BATCH_SIZE
@@ -480,7 +360,7 @@ def fetch_universe(
         f"Fetching {total} FX pairs | "
         f"{len(batches)} batch(es) of up to {BATCH_SIZE} | "
         f"Period: {start_date} to {end_date} | "
-        f"Interval: {FETCH_INTERVAL} -> resampled to {RESAMPLE_INTERVAL} | "
+        f"Interval: {FETCH_INTERVAL} | "
         f"min_rows: {min_rows}"
     )
 
@@ -502,7 +382,7 @@ def fetch_universe(
     combined = pd.concat(all_data, ignore_index=True)
     logger.info(
         f"fetch_universe complete | "
-        f"Total 4H rows: {len(combined)} | "
+        f"Total Daily rows: {len(combined)} | "
         f"Pairs with data: {combined['pair'].nunique()}"
     )
     return combined
@@ -518,16 +398,13 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
     local (SQLite) and cloud (Supabase) modes.
 
     DECISION LOGIC per pair:
-    - Not previously tracked → full HISTORICAL_DAYS fetch (729 days of 1H,
-      resampled to 4H — the yfinance-ceiling-safe maximum, see module
-      docstring)
+    - Not previously tracked → full HISTORICAL_DAYS fetch
     - Already tracked        → incremental INCREMENTAL_DAYS fetch (buffer
       window covering weekend gaps and any missed pipeline runs)
 
     This means:
-    - First ever run: downloads ~2 years of 1H data (heavy one-time cost,
-      then resampled down to 4H bars for storage/compute)
-    - All subsequent runs: only fetch INCREMENTAL_DAYS of 1H per pair
+    - First ever run: downloads massive multi-year historical data.
+    - All subsequent runs: only fetch INCREMENTAL_DAYS of daily data per pair.
 
     Cloud mode tracks last-fetched date per pair via a small Postgres
     table (fetch_tracker), same pattern as the stock project — one bulk
@@ -578,13 +455,6 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
     all_data = []
 
     # ── Full historical fetch ───────────────────────────────────────────────
-    # min_rows here is a real floor — a full-history fetch spanning up to
-    # HISTORICAL_DAYS (729) days of 1H data, resampled to 4H (~6
-    # candles/day), should produce hundreds of rows. A handful of rows
-    # coming back from what's supposed to be a full backfill signals a
-    # real fetch problem (e.g. yfinance returned almost nothing), not a
-    # legitimate small result — so a meaningfully higher floor than the
-    # incremental branch below is correct here, not just a leftover default.
     FULL_FETCH_MIN_ROWS = 50
 
     if full_tickers:
@@ -599,17 +469,6 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
             all_data.append(df_full)
 
     # ── Incremental fetch ────────────────────────────────────────────────────
-    # CRITICAL: min_rows must be small here — this is the exact bug
-    # documented in utils/error_handler.py's validate_dataframe docstring.
-    # An incremental fetch (INCREMENTAL_DAYS=10 window) is CORRECTLY only
-    # a handful of rows by design, especially right after a weekend/holiday
-    # gap or for a pair that just transitioned from full to incremental
-    # status with barely any new candles yet. Using the full-fetch floor
-    # here would silently reject every legitimate incremental fetch, every
-    # run, once most of the universe has transitioned off full-fetch status
-    # — described in that docstring as having caused a near-total pipeline
-    # failure in the stock project. 1 means "at least one new candle
-    # exists" — the minimum meaningful bar for an incremental result.
     INCREMENTAL_FETCH_MIN_ROWS = 1
 
     if incremental_tickers:
@@ -630,9 +489,6 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
     combined = pd.concat(all_data, ignore_index=True)
 
     # ── Update the fetch tracker with what was ACTUALLY fetched ────────────
-    # Uses the real max datetime fetched per pair, not just "today" — a
-    # pair might have gaps or fail partway through, and we don't want to
-    # falsely mark it as caught up when it isn't.
     if _is_cloud and not combined.empty:
         max_dates = (
             combined.groupby("pair")["datetime"]
@@ -642,7 +498,7 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
         )
         write_last_fetch_dates(max_dates)
 
-    logger.info(f"smart_fetch complete | Total 4H rows: {len(combined)}")
+    logger.info(f"smart_fetch complete | Total Daily rows: {len(combined)}")
     return combined
 
 
@@ -717,9 +573,9 @@ def run_data_pipeline() -> dict:
 
     FULL FLOW:
     1. Load fixed 28-pair universe from config
-    2. Smart fetch OHLC data (full or incremental per pair), fetching 1H
-       and resampling to session-anchored 4H internally
-    3. Write raw (4H) prices to storage
+    2. Smart fetch OHLC data (full or incremental per pair), fetching Daily
+       data directly.
+    3. Write raw (Daily) prices to storage
 
     Unlike the stock project, there is no Stage 1 filter step and no
     sector metadata fetch — both are structurally absent for FX, not
@@ -739,7 +595,7 @@ def run_data_pipeline() -> dict:
         tickers                  = get_full_universe()
         summary["universe_size"] = len(tickers)
 
-        # ── Step 2: Smart fetch 4H (resampled from 1H) OHLC ─────────────────
+        # ── Step 2: Smart fetch Daily OHLC ──────────────────────────────────
         df                      = smart_fetch(tickers)
         summary["rows_fetched"] = len(df)
 
@@ -760,3 +616,5 @@ def run_data_pipeline() -> dict:
     except Exception as e:
         logger.critical(f"FX data pipeline failed: {e}", exc_info=True)
         raise
+
+```
