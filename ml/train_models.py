@@ -1,39 +1,53 @@
 """
 ml/train_models.py
 -------------------
-Backfills a rolling indicator history from raw 4H prices, generates
-labels, builds the feature matrix, and trains the Signal Ranker.
+Backfills weekly indicator history, generates directional labels,
+builds feature matrices, and trains FIVE separate basket-grouped
+directional models (one XGBoost classifier per currency basket),
+instead of one Signal Ranker across all 28 pairs.
 
-WHAT'S DIFFERENT FROM THE STOCK PROJECT:
-1. No Volume Classifier — no real volume data exists for FX
-   (decentralized OTC market, see fetcher.py's docstring). This file
-   trains exactly ONE model: the Signal Ranker.
-2. No universe filtering — read_filtered_universe() doesn't exist for
-   FX. The universe is the fixed 28-pair list from config.yaml's
-   universe.pairs, read live (not hardcoded) — matching
-   fetcher.py's get_full_universe().
-3. CSI is computed as a SEPARATE backfill phase, not inside the
-   per-pair backfill_ticker() loop. CSI is inherently cross-pair (see
-   engines/csi.py's module docstring) — you cannot compute
-   CSI_EUR from EURUSD's data alone, you need all 28 pairs' aligned
-   history at once. LinReg/SMC/ADX stay in the per-pair parallel
-   backfill (each is genuinely single-pair), but CSI runs once, after,
-   across the whole universe via engines.csi.compute_csi_series().
-4. Relaxed scan-hit gate is slope + SD-zone ONLY (two conditions, not
-   three). The stock project's third gate was volume_signal ==
-   accumulation/distribution — there is no FX substitute for this.
-   CSI-RS was explicitly considered and rejected as a replacement
-   HARD gate: the whole point of the stock project's own design was
-   that has_valid_zone and CHoCH were demoted from hard gates to ML
-   FEATURES so the model learns to weight them — volume was the one
-   exception that stayed a hard gate. Making CSI a hard gate here
-   would be an asymmetric, arbitrary choice with no better
-   justification than any other feature (ADX, ATR ratio, candlestick)
-   also being promoted to a gate. CSI stays a feature (already in
-   SIGNAL_FEATURE_COLS), consistent with every other engine output in
-   this pipeline. See project discussion for the full reasoning.
-5. Column naming: 'pair'/'datetime' throughout, not 'ticker'/'date' —
-   consistent with every other FX file in this project.
+WHAT'S DIFFERENT FROM THE PRIOR (SIGNAL RANKER) VERSION OF THIS FILE —
+THIS IS A COMPLETE REDESIGN, NOT AN INCREMENTAL CHANGE:
+
+1. FIVE MODELS, NOT ONE. Per project decision: 28 pairs are grouped
+   into 5 currency baskets (defined in config.yaml's universe.baskets),
+   and ONE model is trained PER BASKET rather than one model across
+   all 28 pairs pooled together. Reasoning: JPY-cross pairs share
+   structural drivers (BOJ policy, carry dynamics) genuinely different
+   from CHF crosses (SNB policy, safe-haven flows) or CAD crosses (oil
+   sensitivity) — a single pooled model has to learn one function
+   averaging over several different regimes; basket models let each
+   specialize. See project discussion for the full reasoning and the
+   basket definitions themselves (verified against the real 28-pair
+   universe — no typos, no gaps, no duplicates, across all 5 baskets).
+
+2. NO SCANNER / CANDIDATE GATE AT ALL. The prior version's
+   _is_long_candidate_relaxed / _is_short_candidate_relaxed /
+   build_historical_scan_hits are GONE ENTIRELY. There is no "setup"
+   concept anymore — every weekly candle for every pair gets a
+   directional label and a feature row, unconditionally. This mirrors
+   the reference EURUSD project's own design ("every pair, every
+   cycle") and follows directly from the label redefinition in
+   ml/labeller.py (label_direction: a plain "will price be higher in
+   HORIZON candles" check, not "did a flagged setup hit its target").
+
+3. NO LINREG, NO SMC, ANYWHERE. backfill_pair() previously ran LinReg +
+   SMC + ADX per pair. LinReg and SMC are dropped from this project's
+   scope entirely (per project decision) — this file's backfill now
+   runs ONLY ADX per pair. CSI stays exactly as before: a separate,
+   cross-pair phase (see CSI BACKFILL section) — that was never
+   LinReg/SMC-dependent in the first place.
+
+4. WEEKLY TIMEFRAME, NOT 4H. data/fetcher.py now fetches native Weekly
+   bars (see that module's docstring) — no more session-anchored 4H
+   resampling. This file's backfill loop and its minimum-row
+   requirements are sized in weekly-candle units, not 4H-candle units.
+   ml.label_forward_periods is now 2 (2 WEEKLY candles ahead), read
+   from the SAME config key as before — see ml/labeller.py's module
+   docstring for why this is a repurposed key, not a new one.
+
+5. Column naming: 'pair'/'datetime' throughout — unchanged from every
+   other file in this project.
 
 Every threshold/period/list below is read live from config.yaml —
 nothing in this file hardcodes a value that config already owns.
@@ -65,13 +79,11 @@ else:
     )
     _CLOUD_MODE = False
 
-from engines.linreg import compute_linreg_latest, PERIOD as LINREG_PERIOD
-from engines.smc    import compute_smc
-from engines.adx    import compute_adx_latest
-from engines.csi    import compute_csi_series
-from ml.labeller  import label_scanner_hits
-from ml.features  import build_signal_feature_matrix
-from ml.signal_ranker import train_signal_ranker
+from engines.adx import compute_adx_latest
+from engines.csi import compute_csi_series
+from ml.labeller  import label_direction
+from ml.features  import build_directional_feature_matrix
+from ml.signal_ranker import train_directional_model
 from utils.logging import get_ml_logger
 
 logger = get_ml_logger()
@@ -89,41 +101,40 @@ def _load_config() -> dict:
 config       = _load_config()
 ML_CFG       = config["ml"]
 UNIVERSE_CFG = config["universe"]
-SCANNER_CFG  = config["scanner"]
+ADX_CFG      = config["adx"]
 
-FORWARD = ML_CFG["label_forward_periods"]
+HORIZON = ML_CFG["label_forward_periods"]   # 2 weekly candles, see labeller.py
 STRIDE  = ML_CFG["backfill_stride"]
 
-MIN_SIGNAL_SAMPLES = ML_CFG["min_training_samples"]
+MIN_SAMPLES_PER_BASKET = ML_CFG["min_training_samples"]
 
-# SD zone thresholds from scanner config
-LONG_SD_MIN  = SCANNER_CFG["long_entry_sd_min"]   # -1
-LONG_SD_MAX  = SCANNER_CFG["long_entry_sd_max"]   # -3
-SHORT_SD_MIN = SCANNER_CFG["short_entry_sd_min"]  # +1
-SHORT_SD_MAX = SCANNER_CFG["short_entry_sd_max"]  # +3
+# ADX needs its own warm-up window for a meaningful reading — same
+# reasoning as the old LINREG_PERIOD warm-up guard, just against ADX's
+# own period instead (LinReg no longer exists to size this against).
+ADX_PERIOD = ADX_CFG["period"]
+# A small multiple of ADX_PERIOD gives ADX's own smoothing enough
+# history to stabilise before we trust its output.
+MIN_ROWS_FOR_BACKFILL = ADX_PERIOD * 3
 
-# Fixed 28-pair universe — read live from config, matching
-# fetcher.py's get_full_universe(). No discovery/filtering funnel for FX.
-PAIRS = UNIVERSE_CFG["pairs"]
+# Fixed 28-pair universe, grouped into 5 currency baskets — read live
+# from config, matching fetcher.py's get_full_universe() and the
+# project's basket-model decision.
+PAIRS   = UNIVERSE_CFG["pairs"]
+BASKETS = UNIVERSE_CFG["baskets"]   # dict: basket_name -> list of pairs
 
 # Cap for quick test runs — set to None for full universe
 MAX_PAIRS_FOR_TRAINING = None
 
 
 # =============================================================================
-# ROLLING BACKFILL — per pair (LinReg, SMC, ADX only)
-# CSI is NOT computed here — see the CSI BACKFILL section below and the
-# module docstring for why it's a separate, cross-pair phase.
+# ROLLING BACKFILL — per pair (ADX only)
+# LinReg and SMC are GONE — see module docstring point 3. CSI is NOT
+# computed here either — see the CSI BACKFILL section below.
 # =============================================================================
 
 def backfill_pair(pair: str, df: pd.DataFrame) -> pd.DataFrame:
     """
-    Run LinReg, SMC, and ADX engines on rolling windows of df.
-
-    For each step i (i = LINREG_PERIOD .. len(df)-1, stride STRIDE):
-        window = df.iloc[:i+1]
-        dt     = df.iloc[i]["datetime"]
-        -> compute_linreg_latest, compute_smc, compute_adx_latest
+    Run the ADX engine on rolling windows of df.
 
     Args:
         pair: FX pair symbol, e.g. 'EURUSD'
@@ -135,168 +146,57 @@ def backfill_pair(pair: str, df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     n    = len(df)
 
-    # Need LINREG_PERIOD candles for LinReg + FORWARD candles for labelling
-    if n < LINREG_PERIOD + FORWARD + 1:
+    if n < MIN_ROWS_FOR_BACKFILL + HORIZON + 1:
         logger.debug(
             f"{pair} | Insufficient data for backfill: "
-            f"{n} rows, need {LINREG_PERIOD + FORWARD + 1}"
+            f"{n} rows, need {MIN_ROWS_FOR_BACKFILL + HORIZON + 1}"
         )
         return pd.DataFrame()
 
-    for i in range(LINREG_PERIOD, n, STRIDE):
+    for i in range(MIN_ROWS_FOR_BACKFILL, n, STRIDE):
         window = df.iloc[: i + 1]
         dt     = str(df.iloc[i]["datetime"])
-
-        lr = compute_linreg_latest(pair, window, dt)
-        if lr is None:
-            continue
-
-        smc = compute_smc(
-            pair, window, dt,
-            sd1_lower = lr.get("sd1_lower"),
-            sd3_lower = lr.get("sd3_lower"),
-            sd1_upper = lr.get("sd1_upper"),
-            sd3_upper = lr.get("sd3_upper"),
-        )
-        if smc is None:
-            continue
 
         adx = compute_adx_latest(pair, window, dt)
         if adx is None:
             continue
 
         rows.append({
-            "pair"          : pair,
-            "datetime"      : dt,
-            **{k: v for k, v in lr.items() if k not in ("pair", "datetime")},
-            "smc_structure" : smc["smc_structure"],
-            "has_valid_zone": smc["has_valid_zone"],
-            "adx_value"     : adx["adx_value"],
-            "plus_di"       : adx["plus_di"],
-            "minus_di"      : adx["minus_di"],
+            "pair"      : pair,
+            "datetime"  : dt,
+            "adx_value" : adx["adx_value"],
+            "plus_di"   : adx["plus_di"],
+            "minus_di"  : adx["minus_di"],
         })
 
     return pd.DataFrame(rows)
 
 
 # =============================================================================
-# RELAXED SCAN HIT DETECTION
-# Two conditions only: slope + SD-zone. No third hard gate — CSI, ADX,
-# ATR ratio, candlestick-at-extreme, and has_valid_zone are all ML
-# FEATURES the model learns to weight, not filters that block a row
-# from becoming a training example. See module docstring for the full
-# reasoning on why CSI specifically was NOT promoted to a hard gate.
-# =============================================================================
-
-def _is_long_candidate_relaxed(row: pd.Series) -> bool:
-    """
-    Relaxed long candidate check for training data generation.
-    Requires: slope up + price in -1 to -3 SD zone.
-    Does NOT require: has_valid_zone, CHoCH absence, CSI direction
-    agreement. These become ML features instead of hard filters.
-    """
-    if int(row.get("linreg_slope_up", 0)) != 1:
-        return False
-
-    sd_pos = float(row.get("price_sd_position", 0))
-    if not (LONG_SD_MAX <= sd_pos <= LONG_SD_MIN):   # -3 <= sd <= -1
-        return False
-
-    return True
-
-
-def _is_short_candidate_relaxed(row: pd.Series) -> bool:
-    """
-    Relaxed short candidate check for training data generation.
-    Requires: slope down + price in +1 to +3 SD zone.
-    """
-    if int(row.get("linreg_slope_up", 1)) != 0:
-        return False
-
-    sd_pos = float(row.get("price_sd_position", 0))
-    if not (SHORT_SD_MIN <= sd_pos <= SHORT_SD_MAX):   # +1 <= sd <= +3
-        return False
-
-    return True
-
-
-def build_historical_scan_hits(
-    indicators_history_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Find all historical (pair, datetime) combinations that would have
-    qualified as long or short candidates using the relaxed conditions.
-
-    Unlike the stock project, there is no excluded-tickers set to
-    build (no indices/sectors mixed into the universe — every row in
-    indicators_history_df is a real, scannable pair).
-
-    Args:
-        indicators_history_df: Full backfilled indicator history
-
-    Returns:
-        DataFrame with columns [pair, datetime, direction]
-    """
-    hits = []
-    for _, row in indicators_history_df.iterrows():
-        if _is_long_candidate_relaxed(row):
-            hits.append({
-                "pair"     : row["pair"],
-                "datetime" : row["datetime"],
-                "direction": "long",
-            })
-        if _is_short_candidate_relaxed(row):
-            hits.append({
-                "pair"     : row["pair"],
-                "datetime" : row["datetime"],
-                "direction": "short",
-            })
-
-    logger.info(f"build_historical_scan_hits: {len(hits)} historical setups found")
-    return pd.DataFrame(hits) if hits else pd.DataFrame(
-        columns=["pair", "datetime", "direction"]
-    )
-
-
-# =============================================================================
-# MAIN TRAINING PIPELINE
+# MAIN TRAINING PIPELINE — trains 5 separate basket models
 # =============================================================================
 
 def run_training():
     logger.info("=" * 60)
-    logger.info("ML TRAINING PIPELINE STARTED")
+    logger.info("ML TRAINING PIPELINE STARTED (basket-grouped directional models)")
     logger.info("=" * 60)
 
     initialise_database()
 
-    # Delete stale model to force clean retraining with new fixes
-    from ml.signal_ranker import MODEL_PATH as SIG_PATH
-
-    if SIG_PATH.exists():
-        SIG_PATH.unlink()
-        logger.info(f"Deleted stale model: {SIG_PATH}")
-
-    # ── Step 1: Fixed 28-pair universe (no filtering funnel for FX) ─────────
     pairs = list(PAIRS)
     if MAX_PAIRS_FOR_TRAINING:
         pairs = pairs[:MAX_PAIRS_FOR_TRAINING]
 
     logger.info(
-        f"Backfilling indicators for {len(pairs)} pairs "
-        f"(stride={STRIDE}, linreg_period={LINREG_PERIOD})"
+        f"Backfilling ADX for {len(pairs)} pairs across {len(BASKETS)} "
+        f"baskets (stride={STRIDE}, horizon={HORIZON} weekly candles)"
     )
 
-    # ── Step 2: Rolling backfill per pair (PARALLELIZED) ────────────────────
-    indicator_history = []
     prices_all        = []
+    indicator_history  = []
     backfill_failed    = 0
 
     if _CLOUD_MODE:
-        # Load the full accumulated history once from Supabase Storage,
-        # then filter per pair in memory — avoids re-downloading on
-        # every loop iteration. No days= window — this project needs
-        # the full accumulated history for regime coverage, not a
-        # recent-only slice.
         logger.info("Loading full price history from Supabase Storage...")
         full_history = read_price_history()
         logger.info(f"Loaded {len(full_history)} total rows across all snapshots")
@@ -315,7 +215,6 @@ def run_training():
             for name, group in full_history.groupby("pair")
         }
 
-    # Phase A: Prepare per-pair DataFrames in memory
     logger.info("Preparing pair datasets for parallel processing...")
     pair_tasks = []
     for pair in pairs:
@@ -330,8 +229,7 @@ def run_training():
 
         pair_tasks.append((pair, df))
 
-    # Phase B: Process tasks in parallel across available CPU cores
-    logger.info(f"Launching parallel backfill with {len(pair_tasks)} workers...")
+    logger.info(f"Launching parallel ADX backfill with {len(pair_tasks)} workers...")
 
     with ProcessPoolExecutor() as executor:
         futures = {
@@ -363,8 +261,7 @@ def run_training():
     if not indicator_history:
         logger.error(
             "No indicator history produced — "
-            "pairs may not have enough candles yet. "
-            "Run the pipeline for more days to accumulate data."
+            "pairs may not have enough weekly candles yet."
         )
         return
 
@@ -372,17 +269,15 @@ def run_training():
     prices_all_df          = pd.concat(prices_all, ignore_index=True)
 
     logger.info(
-        f"Per-pair backfill complete | "
+        f"Per-pair ADX backfill complete | "
         f"History rows: {len(indicators_history_df)} | "
         f"Pairs with history: {indicators_history_df['pair'].nunique()} | "
         f"Failed: {backfill_failed}"
     )
 
-    # ── Step 3: CSI backfill — SEPARATE cross-pair phase ────────────────────
-    # CSI cannot be computed inside backfill_pair()'s per-pair loop — it
-    # requires all 28 pairs' aligned history simultaneously (see
-    # engines/csi.py's module docstring). Requires a dict[pair -> df] of
-    # the SAME per-pair price DataFrames used above, built once here.
+    # ── CSI backfill — SEPARATE cross-pair phase, computed ONCE across the
+    # WHOLE universe (not per-basket — CSI needs all 28 pairs' aligned
+    # history regardless of which basket a pair ends up training in) ────
     logger.info("Computing CSI series across the full aligned universe...")
 
     prices_by_pair = {
@@ -394,100 +289,106 @@ def run_training():
 
     if csi_series_df.empty:
         logger.warning(
-            "CSI backfill produced no rows — csi_rs, csi_diff_zscore, "
-            "csi_diff_roc, and csi_commodity_bloc will all be 0.0 for "
-            "all training examples. This will weaken the model but "
-            "training will still proceed."
+            "CSI backfill produced no rows — all 4 CSI features will be "
+            "0.0 for all training examples across every basket."
         )
     else:
         logger.info(f"CSI backfill complete | {len(csi_series_df)} (pair, datetime) rows")
 
-    # ── Step 4: Build historical scan hits for Signal Ranker training ──────
-    logger.info("Building historical scan hits for Signal Ranker training...")
+    # ── Directional labels — UNCONDITIONAL, every row, every pair. No
+    # scanner gate, no candidate concept.
+    logger.info("Generating directional labels for the full universe...")
 
-    scan_hits = build_historical_scan_hits(indicators_history_df)
+    labels_df = label_direction(prices_all_df)
 
-    if scan_hits.empty:
-        logger.warning(
-            "No historical scan hits found. "
-            "This means no pairs had the right combination of: "
-            "slope up/down + price in SD zone. "
-            "Run the pipeline for more days to accumulate diverse market conditions."
+    if labels_df.empty:
+        logger.error(
+            "No directional labels generated at all — cannot train any "
+            "basket model."
         )
-        logger.info("=" * 60)
-        logger.info("ML TRAINING PIPELINE COMPLETE (Signal Ranker skipped)")
-        logger.info("=" * 60)
         return
 
+    pos = (labels_df["label"] == 1).sum()
+    neg = (labels_df["label"] == 0).sum()
     logger.info(
-        f"Scan hits found: {len(scan_hits)} | "
-        f"Longs: {(scan_hits['direction']=='long').sum()} | "
-        f"Shorts: {(scan_hits['direction']=='short').sum()}"
+        f"Directional labels | Total: {len(labels_df)} | "
+        f"Up: {pos} ({pos/len(labels_df)*100:.1f}%) | "
+        f"Down: {neg} ({neg/len(labels_df)*100:.1f}%)"
     )
 
-    # Generate labels for scan hits
-    sig_labels = label_scanner_hits(prices_all_df, indicators_history_df, scan_hits)
+    # ── Train ONE model PER BASKET. CSI/ADX/prices are all pre-computed
+    # above ONCE for the whole universe; this loop just FILTERS to each
+    # basket's pairs before building that basket's own feature matrix.
+    basket_results = {}
 
-    if sig_labels.empty:
-        logger.warning("No signal labels generated — Signal Ranker skipped")
-        return
+    for basket_name, basket_pairs in BASKETS.items():
+        logger.info("=" * 60)
+        logger.info(f"BASKET: {basket_name} | Pairs: {basket_pairs}")
+        logger.info("=" * 60)
 
-    pos = (sig_labels["label"] == 1).sum()
-    neg = (sig_labels["label"] == 0).sum()
-    logger.info(
-        f"Signal labels | Total: {len(sig_labels)} | "
-        f"Positive: {pos} ({pos/len(sig_labels)*100:.1f}%) | "
-        f"Negative: {neg} ({neg/len(sig_labels)*100:.1f}%)"
-    )
+        basket_labels = labels_df[labels_df["pair"].isin(basket_pairs)]
+        basket_prices = prices_all_df[prices_all_df["pair"].isin(basket_pairs)]
 
-    # ── Step 5: Build feature matrix ────────────────────────────────────────
-    sig_matrix = build_signal_feature_matrix(
-        prices_df      = prices_all_df,
-        indicators_df  = indicators_history_df,
-        labels_df      = sig_labels,
-        csi_series_df  = csi_series_df,
-    )
+        if basket_labels.empty:
+            logger.warning(
+                f"{basket_name}: no labels for any pair in this basket — skipped"
+            )
+            basket_results[basket_name] = {"status": "skipped_no_labels"}
+            continue
 
-    if sig_matrix.empty:
-        logger.warning("Signal feature matrix is empty — Signal Ranker skipped")
-        return
+        logger.info(f"{basket_name}: {len(basket_labels)} labelled examples")
 
-    logger.info(f"Signal feature matrix: {len(sig_matrix)} rows")
-
-    # ── Step 6: Train Signal Ranker ─────────────────────────────────────────
-    # Allow even small sample sizes (model still ranks by probability) —
-    # temporarily lower the module's MIN_SAMPLES threshold rather than
-    # skip training outright, restoring it afterward.
-    if len(sig_matrix) < MIN_SIGNAL_SAMPLES:
-        logger.warning(
-            f"Signal Ranker has only {len(sig_matrix)} training samples "
-            f"(minimum is {MIN_SIGNAL_SAMPLES}). "
-            f"Temporarily lowering threshold to train anyway."
-        )
-        import ml.signal_ranker as sr_module
-        original_min = sr_module.MIN_SAMPLES
-        sr_module.MIN_SAMPLES = max(2, len(sig_matrix))
-
-    try:
-        sig_pipeline, sig_metrics = train_signal_ranker(sig_matrix)
-        write_model_metrics(
-            model_name = sig_metrics["model_name"],
-            train_date = sig_metrics["train_date"],
-            precision  = sig_metrics["precision"],
-            auc_roc    = sig_metrics["auc_roc"],
-            n_samples  = sig_metrics["n_train"] + sig_metrics["n_test"],
-            recall     = sig_metrics.get("recall", 0.0),
-            pr_auc     = sig_metrics.get("pr_auc", 0.0),
+        basket_matrix = build_directional_feature_matrix(
+            prices_df      = basket_prices,
+            labels_df      = basket_labels,
+            csi_series_df  = csi_series_df,
         )
 
-        logger.info(
-            f"Signal Ranker trained | "
-            f"Precision: {sig_metrics['precision']:.4f} | "
-            f"AUC-ROC: {sig_metrics['auc_roc']:.4f} | "
-        )
-    finally:
-        if len(sig_matrix) < MIN_SIGNAL_SAMPLES:
-            sr_module.MIN_SAMPLES = original_min
+        if basket_matrix.empty:
+            logger.warning(f"{basket_name}: feature matrix is empty — skipped")
+            basket_results[basket_name] = {"status": "skipped_empty_matrix"}
+            continue
+
+        logger.info(f"{basket_name}: feature matrix built | {len(basket_matrix)} rows")
+
+        if len(basket_matrix) < MIN_SAMPLES_PER_BASKET:
+            logger.warning(
+                f"{basket_name}: only {len(basket_matrix)} training samples "
+                f"(minimum is {MIN_SAMPLES_PER_BASKET}) — skipped."
+            )
+            basket_results[basket_name] = {"status": "skipped_too_few_samples"}
+            continue
+
+        try:
+            basket_pipeline, basket_metrics = train_directional_model(
+                basket_matrix, basket_name=basket_name,
+            )
+            write_model_metrics(
+                model_name = basket_metrics["model_name"],
+                train_date = basket_metrics["train_date"],
+                precision  = basket_metrics["precision"],
+                auc_roc    = basket_metrics["auc_roc"],
+                n_samples  = basket_metrics["n_train"] + basket_metrics["n_test"],
+                recall     = basket_metrics.get("recall", 0.0),
+                pr_auc     = basket_metrics.get("pr_auc", 0.0),
+            )
+
+            logger.info(
+                f"{basket_name} trained | "
+                f"Precision: {basket_metrics['precision']:.4f} | "
+                f"AUC-ROC: {basket_metrics['auc_roc']:.4f}"
+            )
+            basket_results[basket_name] = {"status": "trained", "metrics": basket_metrics}
+
+        except Exception as e:
+            logger.error(f"{basket_name}: training failed: {e}", exc_info=True)
+            basket_results[basket_name] = {"status": "failed", "error": str(e)}
+
+    logger.info("=" * 60)
+    logger.info("BASKET TRAINING SUMMARY")
+    logger.info("=" * 60)
+    for basket_name, result in basket_results.items():
+        logger.info(f"{basket_name}: {result['status']}")
 
     logger.info("=" * 60)
     logger.info("ML TRAINING PIPELINE COMPLETE")
