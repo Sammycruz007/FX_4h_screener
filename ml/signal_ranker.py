@@ -94,7 +94,7 @@ MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
 # have its label computed from a future close that falls inside the
 # test window. HORIZON is the correct thing to size this gap against
 # now that LinReg (which used to size it) is dropped.
-SAFETY_GAP = HORIZON
+SAFETY_GAP = HORIZON + 5
 
 EVAL_THRESHOLDS = sorted(set([0.5, 0.6, 0.7, 0.8, DISPLAY_THRESHOLD]))
 
@@ -174,10 +174,12 @@ def _build_pipeline(scale_pos_weight: float = 1.0) -> Pipeline:
         n_jobs             = -1,
     )
 
+    
+    inner_cv = TimeSeriesSplit(n_splits=2, gap=SAFETY_GAP)
     calibrated_model = CalibratedClassifierCV(
         estimator = base_model,
         method    = "isotonic",
-        cv        = 5,
+        cv        = inner_cv,
     )
 
     pipeline = Pipeline([
