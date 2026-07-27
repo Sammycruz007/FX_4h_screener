@@ -95,6 +95,8 @@ def _load_config() -> dict:
 config      = _load_config()
 ATR_CFG     = config["atr"]
 SESSION_CFG = config["session"]
+BOLLINGER_CFG = config["bollinger"]
+MOMENTUM_CFG  = config["momentum"]
 
 ATR_FAST_PERIOD = ATR_CFG["fast_period"]
 ATR_SLOW_PERIOD = ATR_CFG["slow_period"]
@@ -105,6 +107,19 @@ LONDON_OPEN_UTC    = SESSION_CFG["london_open_utc"]
 LONDON_CLOSE_UTC   = SESSION_CFG["london_close_utc"]
 NEW_YORK_OPEN_UTC  = SESSION_CFG["new_york_open_utc"]
 NEW_YORK_CLOSE_UTC = SESSION_CFG["new_york_close_utc"]
+
+# Bollinger Bands — replaces LinReg's "where is price relative to its
+# recent range" role, computed from a plain rolling SMA/STD instead of
+# a regression channel. 20-period SMA, 2 standard deviations — the
+# conventional default, chosen deliberately for weekly bars (~5 months
+# of history per band), not inherited from a daily-bar config.
+BOLLINGER_PERIOD    = BOLLINGER_CFG["period"]
+BOLLINGER_NUM_STD   = BOLLINGER_CFG["num_std"]
+
+# Rate of Change — the momentum feature. 4-period lookback (~1 month
+# on weekly bars), matching the reference EURUSD project's short-
+# horizon momentum feel.
+ROC_PERIOD = MOMENTUM_CFG["roc_period"]
 
 
 # =============================================================================
@@ -137,6 +152,117 @@ def _compute_atr(px: pd.DataFrame, period: int) -> float:
         atr = float(px["close"].iloc[-1]) * 0.01
 
     return float(atr)
+
+
+# =============================================================================
+# BOLLINGER BANDS
+# Replaces LinReg's "where is price relative to its recent range" role
+# — per the reference EURUSD project's README, Bollinger-derived
+# features were its SECOND most important feature group. Computed from
+# a plain rolling SMA/STD, not a regression channel, so this has no
+# LinReg dependency at all.
+# =============================================================================
+
+def _compute_bollinger(px: pd.DataFrame) -> dict:
+    """
+    Compute Bollinger Band position for the latest candle.
+
+    MATHS:
+    - sma    = rolling mean of close over BOLLINGER_PERIOD candles
+    - std    = rolling std of close over BOLLINGER_PERIOD candles
+    - upper  = sma + BOLLINGER_NUM_STD * std
+    - lower  = sma - BOLLINGER_NUM_STD * std
+    - %B     = (close - lower) / (upper - lower) — 0 = at lower band,
+               1 = at upper band, 0.5 = at the middle SMA. Unbounded
+               beyond [0,1] when price closes outside the bands
+               entirely (a genuine, informative signal — not clipped).
+    - bandwidth = (upper - lower) / sma — a volatility-regime measure,
+               analogous in spirit to ATR ratio but band-based rather
+               than true-range-based.
+
+    Args:
+        px: OHLC DataFrame, sorted datetime ascending, already
+            filtered to <= signal datetime by the caller
+
+    Returns:
+        Dict with bollinger_pct_b and bollinger_bandwidth. Falls back
+        to pct_b=0.5 (i.e. "at the middle, no information") and
+        bandwidth=0.0 if fewer than BOLLINGER_PERIOD candles are
+        available — a neutral default, not a fabricated extreme.
+    """
+    recent = px["close"].tail(BOLLINGER_PERIOD)
+
+    if len(recent) < BOLLINGER_PERIOD:
+        return {"bollinger_pct_b": 0.5, "bollinger_bandwidth": 0.0}
+
+    sma = recent.mean()
+    std = recent.std()
+
+    upper = sma + BOLLINGER_NUM_STD * std
+    lower = sma - BOLLINGER_NUM_STD * std
+
+    current_close = px["close"].iloc[-1]
+
+    band_range = upper - lower
+
+    # Use a RELATIVE tolerance (band_range vs. price scale), not a
+    # strict > 0 check — floating-point std() on genuinely-flat prices
+    # (e.g. all closes exactly 1.10) does not return exact 0.0, it
+    # returns something like 8e-16 due to float representation. A
+    # strict > 0 check treats that near-zero as "a real band," and
+    # computes pct_b from an almost-zero-width band — producing a
+    # meaningless, wildly sensitive value (e.g. 0.25 instead of the
+    # intended neutral 0.5) instead of correctly falling back. Caught
+    # in testing: a flat-price fixture failed the "neutral fallback"
+    # assertion for exactly this reason.
+    if band_range > (1e-8 * max(abs(sma), 1e-8)):
+        pct_b     = (current_close - lower) / band_range
+        bandwidth = band_range / sma if sma > 0 else 0.0
+    else:
+        # Effectively zero band width (flat price over the whole
+        # window) — no meaningful band to position against; neutral
+        # defaults, not a divide-by-near-zero.
+        pct_b     = 0.5
+        bandwidth = 0.0
+
+    return {
+        "bollinger_pct_b"    : float(pct_b),
+        "bollinger_bandwidth": float(bandwidth),
+    }
+
+
+# =============================================================================
+# RATE OF CHANGE — the momentum feature
+# Per the reference EURUSD project's README momentum feature group.
+# =============================================================================
+
+def _compute_roc(px: pd.DataFrame) -> float:
+    """
+    Compute Rate of Change: percentage price change over ROC_PERIOD
+    candles (4 weekly candles ≈ 1 month, per project decision).
+
+    MATHS:
+        roc = (close[t] - close[t - ROC_PERIOD]) / close[t - ROC_PERIOD]
+
+    Args:
+        px: OHLC DataFrame, sorted datetime ascending, already
+            filtered to <= signal datetime by the caller
+
+    Returns:
+        ROC as a plain float (e.g. 0.02 = +2% over the period).
+        Falls back to 0.0 (no momentum signal) if fewer than
+        ROC_PERIOD + 1 candles are available.
+    """
+    if len(px) < ROC_PERIOD + 1:
+        return 0.0
+
+    current_close = px["close"].iloc[-1]
+    past_close    = px["close"].iloc[-(ROC_PERIOD + 1)]
+
+    if past_close == 0:
+        return 0.0
+
+    return float((current_close - past_close) / past_close)
 
 
 # =============================================================================
@@ -210,6 +336,18 @@ def compute_directional_features(
 
     GROUP 5 — Currency Strength Index (4 features, unchanged):
     - csi_rs, csi_diff_zscore, csi_diff_roc, csi_commodity_bloc
+
+    GROUP 6 — Bollinger Bands (2 features): replaces LinReg's "where is
+    price relative to its recent range" role, per the reference
+    project's README (its second most important feature group):
+    - bollinger_pct_b   : (close - lower) / (upper - lower), 0=lower
+      band, 1=upper band, 0.5=middle SMA
+    - bollinger_bandwidth: (upper - lower) / sma — volatility-regime
+      measure, band-based analog to atr_ratio
+
+    GROUP 7 — Rate of Change (1 feature): the momentum feature, per
+    the reference project's README:
+    - roc : (close[t] - close[t-ROC_PERIOD]) / close[t-ROC_PERIOD]
 
     Args:
         pair           : FX pair symbol e.g. 'EURUSD'
@@ -307,6 +445,15 @@ def compute_directional_features(
             csi_diff_roc       = float(roc_val)    if pd.notna(roc_val)    else 0.0
             csi_commodity_bloc = float(bloc_val)   if pd.notna(bloc_val)   else 0.0
 
+    # ── GROUP 6: Bollinger Bands ─────────────────────────────────────────────
+    bollinger = _compute_bollinger(px)
+
+    # ── GROUP 7: Rate of Change (momentum) ──────────────────────────────────
+    # Named price_roc (not bare "roc") to avoid any confusion with
+    # csi_diff_roc above — genuinely different things (price momentum
+    # vs. the rate of change of the CSI relative-strength gap).
+    price_roc = _compute_roc(px)
+
     # ── Assemble all features ─────────────────────────────────────────────────
     features = {
         # Identifiers (not used in training — dropped before fit)
@@ -335,6 +482,13 @@ def compute_directional_features(
         "csi_diff_zscore"    : round(csi_diff_zscore,    6),
         "csi_diff_roc"       : round(csi_diff_roc,       6),
         "csi_commodity_bloc" : round(csi_commodity_bloc, 6),
+
+        # Group 6: Bollinger Bands
+        "bollinger_pct_b"    : round(bollinger["bollinger_pct_b"],     6),
+        "bollinger_bandwidth": round(bollinger["bollinger_bandwidth"], 6),
+
+        # Group 7: Rate of Change (momentum)
+        "price_roc"          : round(price_roc, 6),
     }
 
     return features
@@ -476,4 +630,9 @@ DIRECTIONAL_FEATURE_COLS = [
     "csi_diff_zscore",
     "csi_diff_roc",
     "csi_commodity_bloc",
+    # Bollinger Bands (replaces LinReg's band-position role)
+    "bollinger_pct_b",
+    "bollinger_bandwidth",
+    # Rate of Change (momentum)
+    "price_roc",
 ]
