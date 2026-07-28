@@ -1,63 +1,47 @@
 """
 run_pipeline_cloud.py
 ----------------------
-Main orchestrator for the FX Scanner cloud pipeline (GitHub Actions).
+Main orchestrator for the FX directional-prediction cloud pipeline
+(GitHub Actions).
 
-Runs TWICE daily per config.yaml's scheduler.run_times (["12:00",
-"20:00"] UTC — see that config section's comment for why these two
-times specifically). Each run:
-   1. Fetches 4H OHLC data (1H fetched + session-anchored resampled,
-      see data/fetcher.py) for the fixed 28-pair universe
-   2. Snapshots raw prices to Supabase Storage, then consolidates
-      accumulated snapshots (see data/storage_cloud.py)
-   3. Runs LinReg + SMC + ADX per-pair, and CSI once across the whole
-      aligned universe (CSI is inherently cross-pair, see
-      engines/csi.py — cannot be computed inside a per-pair loop)
-   4. Writes indicator results to Supabase Postgres
-   5. Runs the scanner (slope + SD-zone gate only — see
-      scanner/screener.py's module docstring for why there's no
-      market/sector waterfall for FX)
-   6. Scores candidates with the Signal Ranker (CSI features included,
-      candlestick-at-extreme computed HERE — see STEP 8.5 below for
-      why this can't happen earlier)
-   7. Writes ranked scan results to Supabase Postgres
+WHAT'S DIFFERENT FROM THE PRIOR (SIGNAL RANKER SCANNER) VERSION —
+THIS IS A COMPLETE REDESIGN, NOT AN INCREMENTAL CHANGE:
 
-WHAT'S DROPPED FROM THE STOCK PROJECT'S VERSION OF THIS FILE:
-   - Stage 1 filter (Step 4) — no filtering funnel for FX, fixed
-     28-pair universe scanned directly (see fetcher.py/screener.py)
-   - Sector metadata fetch (Step 5) — no sectors for currencies
-   - Volume Classifier scoring — no real volume data exists for FX
-     (decentralized OTC market, see fetcher.py's docstring); Signal
-     Ranker is the only model
-   - GFT watchlist filtering + separate write (Step 11) — a 15-stock
-     evaluation-account diagnostic with no FX equivalent, dropped
-     entirely per project decision (see ml/signal_ranker.py's
-     module docstring)
-   - prune_old_snapshots() — never actually called in the stock
-     version either in principle (data/storage_cloud.py's docstring
-     says not to), but the stock run_pipeline_cloud.py called it
-     anyway; that call is NOT carried over here. Replaced by
-     consolidate_snapshots(), which IS correctly wired in below
-     (see STEP 3.5) — it bounds Storage growth safely, unlike a
-     blunt age-based prune (see storage_cloud.py's own docstring for
-     why the difference matters).
+1. WEEKLY, NOT 4H. data/fetcher.py now fetches native Weekly bars — no
+   1H fetch, no session-anchored resampling. See that module's
+   docstring.
 
-WHY CANDLESTICK FEATURES ARE COMPUTED AFTER THE SCANNER, NOT WITH THE
-OTHER INDICATOR ENGINES (STEP 7):
-   engines/candlestick.py's hammer_at_extreme is direction-aware — it
-   needs to know whether a LONG or a SHORT is being evaluated for a
-   given (pair, datetime) to decide whether a detected pattern "counts"
-   (see that module's docstring). But direction doesn't exist as a
-   concept until the scanner (Step 8) has actually identified which
-   pairs are long candidates vs. short candidates. Computing candlestick
-   features for a pair in BOTH directions before knowing which one(s)
-   apply would be pure wasted work for the ~24 of 28 pairs that don't
-   qualify as a candidate in either direction on a given run. So
-   candlestick features are computed in STEP 8.5, strictly after the
-   scanner and strictly only for the actual candidates it produced —
-   this is the one point in the pipeline where the per-pair engine
-   sequence genuinely depends on the scanner's output, not the other
-   way around.
+2. NO LINREG, NO SMC, NO SCANNER, NO CANDIDATES. The prior pipeline's
+   steps for LinReg + SMC per pair, the scanner slope+SD-zone gate,
+   and direction-aware candlestick-at-extreme computed only for
+   candidates are GONE ENTIRELY. There is no "setup" or "candidate"
+   concept in this design — every pair in every basket gets an
+   unconditional up/down PREDICTION every run. Candlestick features
+   are now RAW pattern flags (is_hammer, is_shooting_star), computed
+   for every pair up front alongside ADX/CSI, with no gating logic and
+   no dependency on a scanner result that no longer exists (see
+   ml/features.py and engines/candlestick.py's module docstrings).
+
+3. FIVE BASKET MODELS, NOT ONE SIGNAL RANKER. ML scoring now loops
+   over config.yaml's universe.baskets, calling
+   ml.signal_ranker.predict_direction() once per basket — each basket
+   has its OWN trained model (models/directional_{basket_name}.pkl),
+   scored only against that basket's own pairs.
+
+4. DISPLAY THRESHOLD APPLIED HERE, EXPLICITLY, NOT INSIDE THE MODEL.
+   Per project decision: each model only surfaces a prediction if its
+   probability of success passes the configured threshold (e.g.
+   >=70%), and only THAT gets displayed on the dashboard.
+   predict_direction() itself returns EVERY pair's raw probability,
+   unfiltered — this orchestrator is where config.yaml's
+   ml.high_probability_threshold is actually applied, so that decision
+   lives in exactly one place, not duplicated or buried in the model.
+
+5. Every pair gets a row in indicator_results (ADX + CSI + candlestick
+   flags), but prediction_results (replacing the old scan_results
+   table) ONLY includes rows that (a) had enough history to score at
+   all and (b) cleared the display threshold. Rows that didn't clear
+   the threshold are NOT written.
 
 COLUMN NAMING (pair/datetime, not ticker/date):
    Consistent with every other file in this project.
@@ -77,18 +61,15 @@ from data.fetcher import get_full_universe, smart_fetch, to_pair_dict
 from data.database_cloud import (
     initialise_database,
     write_indicator_results,
-    write_scan_results,
+    write_prediction_results,
 )
 from data.storage_cloud import write_snapshot, consolidate_snapshots, read_price_history
 
-from engines.linreg import compute_linreg_latest
-from engines.smc    import compute_smc
-from engines.adx    import compute_adx_latest
-from engines.csi    import run_csi_engine
-from engines.candlestick import compute_candlestick_latest
+from engines.adx import compute_adx_latest
+from engines.csi import run_csi_engine
+from engines.candlestick import compute_raw_pattern_flags
 
-from scanner.screener import run_scanner
-from ml.signal_ranker  import score_candidates, load_signal_ranker
+from ml.signal_ranker import predict_direction, load_directional_model
 
 from utils.logging import get_pipeline_logger
 
@@ -104,10 +85,14 @@ def _load_config() -> dict:
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
-config      = _load_config()
-STORAGE_CFG = config["storage"]
+config       = _load_config()
+STORAGE_CFG  = config["storage"]
+ML_CFG       = config["ml"]
+UNIVERSE_CFG = config["universe"]
 
-RETENTION_DAYS = STORAGE_CFG["retention_days"]
+RETENTION_DAYS     = STORAGE_CFG["retention_days"]
+DISPLAY_THRESHOLD  = ML_CFG["high_probability_threshold"]
+BASKETS            = UNIVERSE_CFG["baskets"]
 
 
 # =============================================================================
@@ -119,11 +104,10 @@ def run_full_pipeline():
     run_dt_str  = run_start.isoformat()
 
     logger.info("=" * 70)
-    logger.info("FX SCANNER — CLOUD PIPELINE RUN")
+    logger.info("FX DIRECTIONAL PREDICTION — CLOUD PIPELINE RUN")
     logger.info(f"Run datetime (UTC): {run_dt_str}")
     logger.info("=" * 70)
 
-    # ── STEP 1: Initialise Supabase ─────────────────────────────────────────
     logger.info("\n[STEP 1] Initialising Supabase...")
     try:
         initialise_database()
@@ -132,20 +116,15 @@ def run_full_pipeline():
         logger.critical(f"Supabase initialisation failed: {e}", exc_info=True)
         return
 
-    # ── STEP 2: Fixed 28-pair universe (no discovery/filtering funnel) ──────
     logger.info("\n[STEP 2] Loading fixed FX pair universe...")
     try:
         tickers = get_full_universe()
-        logger.info(f"Universe: {len(tickers)} pairs")
+        logger.info(f"Universe: {len(tickers)} pairs across {len(BASKETS)} baskets")
     except Exception as e:
         logger.critical(f"Universe load failed: {e}", exc_info=True)
         return
 
-    # ── STEP 3: Fetch 4H OHLC (1H fetched + session-anchored resampled) ─────
-    logger.info(
-        "\n[STEP 3] Fetching 4H OHLC data "
-        "(full 729-day backfill or incremental, see fetcher.py)..."
-    )
+    logger.info("\n[STEP 3] Fetching Weekly OHLC data...")
     try:
         raw_df = smart_fetch(tickers)
         if raw_df.empty:
@@ -158,7 +137,6 @@ def run_full_pipeline():
         logger.critical(f"Fetch failed: {e}", exc_info=True)
         return
 
-    # ── STEP 3.4: Snapshot raw prices to Supabase Storage ───────────────────
     logger.info("\n[STEP 3.4] Writing raw price snapshot to Supabase Storage...")
     try:
         snapshot_ok = write_snapshot(raw_df, run_timestamp=run_start)
@@ -166,19 +144,11 @@ def run_full_pipeline():
             logger.info("Snapshot written successfully")
         else:
             logger.warning(
-                "Snapshot write failed or partial — continuing pipeline "
-                "anyway (non-fatal, see storage_cloud.py's docstring)"
+                "Snapshot write failed or partial — continuing pipeline anyway"
             )
     except Exception as e:
         logger.warning(f"Snapshot write raised an exception: {e} — continuing")
 
-    # ── STEP 3.5: Consolidate accumulated snapshots ─────────────────────────
-    # Bounds both Storage bytes AND object count without ever losing
-    # in-window data — see storage_cloud.py's consolidate_snapshots()
-    # docstring for the full mechanics and why this replaces the stock
-    # project's blunt age-based prune_old_snapshots (never actually
-    # wired into that project's orchestrator either, despite being
-    # called there — see this module's docstring).
     logger.info(
         f"\n[STEP 3.5] Consolidating Storage snapshots "
         f"(retention: {RETENTION_DAYS} days)..."
@@ -188,37 +158,17 @@ def run_full_pipeline():
         if consolidate_ok:
             logger.info("Snapshot consolidation complete")
         else:
-            logger.warning(
-                "Snapshot consolidation failed or was skipped — continuing "
-                "pipeline anyway (non-fatal; old snapshots simply "
-                "accumulate one more run's worth until the next success)"
-            )
+            logger.warning("Snapshot consolidation failed or was skipped — continuing")
     except Exception as e:
         logger.warning(f"Consolidation raised an exception: {e} — continuing")
 
-    # ── STEP 3.6: Read back the FULL consolidated history for engines ───────
-    # CRITICAL FIX: raw_df (from STEP 3) is deliberately tiny on every run
-    # after the first — smart_fetch's whole design is to fetch only NEW
-    # candles incrementally (see fetcher.py's docstring), not the full
-    # history every time. But every downstream engine (LinReg needs
-    # 2xLINREG_PERIOD=400+ rows, SMC/ADX/CSI all need substantial
-    # history too) needs the FULL accumulated window, not just this
-    # run's delta. STEP 3.5 already consolidated the complete history
-    # into Storage — this step reads it back so engines operate on the
-    # real, full dataset rather than on raw_df's few dozen rows per pair.
-    # This was a real bug: the first-ever run (full 729-day fetch)
-    # happened to have raw_df == the full history, masking the problem
-    # until the second run's incremental fetch made every engine starve
-    # for data and the whole pipeline abort with "No indicator rows
-    # computed for any pair."
     logger.info("\n[STEP 3.6] Reading back full consolidated history for engines...")
     try:
         working_df = read_price_history()
         if working_df.empty:
             logger.warning(
                 "read_price_history returned empty after consolidation — "
-                "falling back to this run's raw_df (may be too small for "
-                "some engines, e.g. LinReg, on anything but a first-ever run)"
+                "falling back to this run's raw_df"
             )
             working_df = raw_df
         else:
@@ -228,15 +178,10 @@ def run_full_pipeline():
             )
     except Exception as e:
         logger.warning(
-            f"read_price_history failed: {e} — falling back to this run's "
-            f"raw_df (may be too small for some engines)"
+            f"read_price_history failed: {e} — falling back to this run's raw_df"
         )
         working_df = raw_df
 
-    # ── STEP 6: Reshape long-form history into per-pair dict ────────────────
-    # (Numbered to match the stock project's step numbering where the
-    # analogous "load price data for engines" step lived — Stage 1/
-    # sector steps 4-5 don't exist for FX, so this is the next real step.)
     logger.info("\n[STEP 6] Reshaping price data for indicator engines...")
     try:
         tickers_data = to_pair_dict(working_df)
@@ -248,14 +193,7 @@ def run_full_pipeline():
         logger.critical(f"Reshape failed: {e}", exc_info=True)
         return
 
-    # ── STEP 7: Run indicator engines ────────────────────────────────────────
-    # LinReg + SMC + ADX are genuinely per-pair — computed in a loop.
-    # CSI is NOT — it requires all 28 pairs' aligned history at once
-    # (see engines/csi.py's module docstring), so it runs ONCE across
-    # the whole universe, separately from the per-pair loop below. This
-    # mirrors the exact same restructuring done in ml/train_models.py's
-    # backfill, for the same reason.
-    logger.info("\n[STEP 7] Running indicator engines...")
+    logger.info("\n[STEP 7] Running indicator engines (ADX, candlestick, CSI)...")
 
     scan_datetime = None
     indicator_rows = []
@@ -268,33 +206,22 @@ def run_full_pipeline():
         if scan_datetime is None:
             scan_datetime = latest_dt
 
-        lr = compute_linreg_latest(pair, df, latest_dt)
-        if lr is None:
-            continue
-
-        smc = compute_smc(
-            pair, df, latest_dt,
-            sd1_lower=lr.get("sd1_lower"),
-            sd3_lower=lr.get("sd3_lower"),
-            sd1_upper=lr.get("sd1_upper"),
-            sd3_upper=lr.get("sd3_upper"),
-        )
-        if smc is None:
-            continue
-
         adx = compute_adx_latest(pair, df, latest_dt)
         if adx is None:
             continue
 
+        pattern_flags = compute_raw_pattern_flags(pair, df)
+        if pattern_flags is None:
+            pattern_flags = {"is_hammer": 0, "is_shooting_star": 0}
+
         indicator_rows.append({
-            "pair"    : pair,
-            "datetime": latest_dt,
-            **{k: v for k, v in lr.items() if k not in ("pair", "datetime")},
-            "smc_structure" : smc["smc_structure"],
-            "has_valid_zone": smc["has_valid_zone"],
-            "adx_value"     : adx["adx_value"],
-            "plus_di"       : adx["plus_di"],
-            "minus_di"      : adx["minus_di"],
+            "pair"             : pair,
+            "datetime"         : latest_dt,
+            "adx_value"        : adx["adx_value"],
+            "plus_di"          : adx["plus_di"],
+            "minus_di"         : adx["minus_di"],
+            "is_hammer"        : pattern_flags["is_hammer"],
+            "is_shooting_star" : pattern_flags["is_shooting_star"],
         })
 
     if not indicator_rows:
@@ -302,9 +229,8 @@ def run_full_pipeline():
         return
 
     indicator_df = pd.DataFrame(indicator_rows)
-    logger.info(f"LinReg + SMC + ADX: {len(indicator_df)} pairs computed")
+    logger.info(f"ADX + candlestick: {len(indicator_df)} pairs computed")
 
-    # CSI — separate cross-pair phase, computed once for the whole universe
     try:
         csi_df = run_csi_engine(tickers_data, date=scan_datetime)
         logger.info(f"CSI: {len(csi_df)} pairs computed")
@@ -312,22 +238,12 @@ def run_full_pipeline():
         logger.warning(f"CSI engine failed: {e} — continuing with empty csi_df")
         csi_df = pd.DataFrame()
 
-    # Merge CSI's 6 features onto indicator_df so write_indicator_results
-    # persists them alongside LinReg/SMC/ADX in one row per pair. Includes
-    # csi_base_zscore/csi_quote_zscore (dashboard-display-only, not a
-    # model feature — see engines/csi.py's module docstring) alongside
-    # the 4 model-feature CSI columns, since both sets live in the same
-    # indicator_results row and the dashboard reads from that same table.
     csi_cols = [
         "pair", "csi_rs", "csi_diff_zscore", "csi_diff_roc", "csi_commodity_bloc",
         "csi_base_zscore", "csi_quote_zscore",
     ]
     if not csi_df.empty:
-        indicator_df = indicator_df.merge(
-            csi_df[csi_cols],
-            on="pair",
-            how="left",
-        )
+        indicator_df = indicator_df.merge(csi_df[csi_cols], on="pair", how="left")
     else:
         for col in csi_cols:
             if col != "pair":
@@ -338,113 +254,77 @@ def run_full_pipeline():
         logger.info(f"Indicator results written: {rows_written} rows")
     except Exception as e:
         logger.error(f"Failed to write indicator results: {e}", exc_info=True)
-        # Non-fatal — the scanner can still run on the in-memory indicator_df
-        # even if the Supabase write failed.
 
-    # ── STEP 8: Run scanner ───────────────────────────────────────────────────
-    # Slope + SD-zone gate only — no market/sector waterfall for FX (see
-    # scanner/screener.py's module docstring). This gate MUST match
-    # ml/train_models.py's relaxed candidate gate exactly, or the model
-    # is scored on a different definition of "candidate" than it was
-    # trained on — verified identical via testing at build time.
-    logger.info("\n[STEP 8] Running scanner...")
-    try:
-        candidates_df = run_scanner(indicator_df, datetime_str=scan_datetime)
-        if candidates_df.empty:
-            logger.info("No candidates found this run. Pipeline complete (nothing to score/write).")
-            _log_pipeline_complete(run_start)
-            return
-        logger.info(
-            f"Scanner found {len(candidates_df)} candidates | "
-            f"Long: {(candidates_df['direction']=='long').sum()} | "
-            f"Short: {(candidates_df['direction']=='short').sum()}"
-        )
-    except Exception as e:
-        logger.critical(f"Scanner failed: {e}", exc_info=True)
-        return
+    logger.info("\n[STEP 9] Running basket-grouped directional predictions...")
 
-    # ── STEP 8.5: Candlestick-at-extreme, computed HERE — see module ────────
-    # docstring's "WHY CANDLESTICK FEATURES ARE COMPUTED AFTER THE
-    # SCANNER" section for the full reasoning. Only computed for actual
-    # candidates, not the whole 28-pair universe — direction-aware, so
-    # doing this earlier for every pair in both directions would be
-    # mostly wasted work.
-    logger.info("\n[STEP 8.5] Computing candlestick-at-extreme features for candidates...")
-    hammer_results = []
-    for _, cand_row in candidates_df.iterrows():
-        pair      = cand_row["pair"]
-        direction = cand_row["direction"]
-        sd_pos    = float(cand_row["sd_position"])
+    all_predictions = []
 
-        px = tickers_data.get(pair)
-        if px is None or px.empty:
-            continue
+    for basket_name, basket_pairs in BASKETS.items():
+        logger.info(f"  Basket: {basket_name} | Pairs: {basket_pairs}")
 
-        result = compute_candlestick_latest(
-            pair            = pair,
-            df              = px,
-            signal_datetime = scan_datetime,
-            sd_position     = sd_pos,
-            direction       = direction,
-        )
-        if result is not None:
-            hammer_results.append({
-                "pair"     : pair,
-                "direction": direction,
-                **result,
-            })
-
-    if hammer_results:
-        hammer_df = pd.DataFrame(hammer_results)
-        # Merge candlestick's raw pattern flags back onto indicator_df
-        # (keyed by pair only — candlestick patterns aren't direction-
-        # specific themselves, only the interaction feature is) so
-        # write_indicator_results persists is_hammer/is_shooting_star
-        # alongside everything else.
-        pattern_flags = hammer_df[["pair", "is_hammer", "is_shooting_star"]].drop_duplicates(subset=["pair"])
-        indicator_df = indicator_df.merge(pattern_flags, on="pair", how="left")
         try:
-            write_indicator_results(indicator_df)
-        except Exception as e:
-            logger.warning(f"Failed to re-write indicator results with candlestick flags: {e}")
-        logger.info(f"Candlestick features computed for {len(hammer_results)} candidate rows")
-    else:
-        logger.warning("No candlestick results computed for any candidate")
+            pipeline = load_directional_model(basket_name)
+            if pipeline is None:
+                logger.warning(
+                    f"  {basket_name}: model not found — skipping this basket"
+                )
+                continue
 
-    # ── STEP 9: ML scoring (Signal Ranker only — no Volume Classifier) ──────
-    logger.info("\n[STEP 9] Running Signal Ranker scoring...")
-    try:
-        pipeline = load_signal_ranker()
-        if pipeline is None:
-            logger.warning(
-                "Signal Ranker model not found — candidates will be ranked "
-                "by SD position only (see ml/signal_ranker.py's score_candidates "
-                "fallback behaviour). Train the model via ml/train_models.py."
+            basket_predictions = predict_direction(
+                basket_name     = basket_name,
+                basket_pairs    = basket_pairs,
+                prices_df       = working_df,
+                csi_df          = csi_df,
+                signal_datetime = scan_datetime,
+                pipeline        = pipeline,
             )
 
-        scored_df = score_candidates(
-            candidates_df   = candidates_df,
-            prices_df       = working_df,
-            indicators_df   = indicator_df,
-            csi_df          = csi_df,
-            signal_datetime = scan_datetime,
-            pipeline        = pipeline,
-        )
-        logger.info("Signal Ranker scoring complete")
-    except Exception as e:
-        logger.error(f"ML scoring failed: {e} — writing candidates unscored", exc_info=True)
-        scored_df = candidates_df
+            if not basket_predictions.empty:
+                basket_predictions["basket"] = basket_name
+                all_predictions.append(basket_predictions)
 
-    # ── STEP 10: Write scan results to Supabase ─────────────────────────────
-    logger.info("\n[STEP 10] Writing scan results to Supabase...")
+        except Exception as e:
+            logger.error(f"  {basket_name}: prediction failed: {e}", exc_info=True)
+            continue
+
+    if not all_predictions:
+        logger.warning("No predictions produced by any basket model this run.")
+        _log_pipeline_complete(run_start)
+        return
+
+    predictions_df = pd.concat(all_predictions, ignore_index=True)
+    logger.info(f"Total predictions across all baskets: {len(predictions_df)}")
+
+    predictions_df["direction"] = predictions_df["up_probability"].apply(
+        lambda p: "up" if p >= 0.5 else "down"
+    )
+    predictions_df["confidence"] = predictions_df["up_probability"].apply(
+        lambda p: p if p >= 0.5 else 1 - p
+    )
+
+    display_df = predictions_df[predictions_df["confidence"] >= DISPLAY_THRESHOLD].copy()
+
+    logger.info(
+        f"Predictions clearing display threshold ({DISPLAY_THRESHOLD}): "
+        f"{len(display_df)}/{len(predictions_df)}"
+    )
+
+    if not display_df.empty:
+        display_df = display_df.sort_values("confidence", ascending=False).reset_index(drop=True)
+        logger.info(
+            f"Top display predictions:\n"
+            f"{display_df[['pair','basket','direction','confidence']].to_string(index=False)}"
+        )
+
+    logger.info("\n[STEP 10] Writing display-threshold predictions to Supabase...")
     try:
-        if not scored_df.empty:
-            rows = write_scan_results(scored_df, run_datetime=scan_datetime)
-            logger.info(f"Scan results written: {rows} candidates")
+        if not display_df.empty:
+            rows = write_prediction_results(display_df, run_datetime=scan_datetime)
+            logger.info(f"Prediction results written: {rows} rows")
         else:
-            logger.info("No candidates to write")
+            logger.info("No predictions cleared the display threshold this run — nothing written")
     except Exception as e:
-        logger.error(f"Failed to write scan results: {e}", exc_info=True)
+        logger.error(f"Failed to write prediction results: {e}", exc_info=True)
 
     _log_pipeline_complete(run_start)
 
