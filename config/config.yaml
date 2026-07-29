@@ -32,7 +32,7 @@ logging:
   max_file_size_mb: 10
 
 ml:
-  high_probability_threshold: 0.65
+  high_probability_threshold: 0.55
   # Locked: 2 weekly candles ahead (~2 weeks forward).
   label_forward_periods: 2
   min_training_samples: 50
@@ -155,7 +155,7 @@ csi:
   # its OWN rolling history, so a pair-specific RS gap is comparable
   # across all 28 pairs regardless of each pair's typical RS-gap
   
-  zscore_window: 20
+  zscore_window: 24
   # csi_diff_roc — momentum/exhaustion on the RS gap itself: is it
   # accelerating or rolling over? Differenced over 5 weekly candles —
   # short enough to catch a genuine turn without being pure
@@ -175,6 +175,67 @@ atr:
 candlestick:
   # Hammer / Shooting Star detection — hand-crafted interaction with
   extreme_sd_threshold: 1.0
+
+rsi:
+  period: 14   # Wilder's standard default — timeframe-invariant convention
+
+macd:
+  fast_period: 12
+  slow_period: 26
+  signal_period: 9
+
+trend:
+  # SMA periods for price-vs-trend position features (price_vs_sma20,
+  # price_vs_sma50, sma_cross), matching the EURUSD reference project.
+  sma_fast: 20
+  sma_slow: 50
+
+macro:
+  # External, non-price-derived drivers — the EURUSD-only project's
+  # biggest edge came from these (DXY/10Y yield/gold), which the
+  # original basket design had none of. Mapped per basket to each
+  # quote currency's real fundamental driver, not just reused
+  # generically across all baskets.
+  #
+  # yfinance tickers:
+  #   DXY    -> "DX-Y.NYB"  (US Dollar Index)
+  #   GOLD   -> "GC=F"      (Gold futures)
+  #   US10Y  -> "^TNX"      (US 10-Year Treasury yield)
+  #   WTI    -> "CL=F"      (WTI Crude Oil futures — Canada's top export)
+  #   VIX    -> "^VIX"      (CBOE Volatility Index — safe-haven/risk-off
+  #                          proxy; used for CHF and JPY since no free,
+  #                          reliable CHF/JPY-specific yield series
+  #                          exists on yfinance, and both currencies'
+  #                          moves are driven far more by risk sentiment
+  #                          / carry-unwind flows than by their own
+  #                          domestic yield)
+  drivers:
+    DXY:
+      yf_ticker: "DX-Y.NYB"
+      storage_symbol: "DXY"
+    GOLD:
+      yf_ticker: "GC=F"
+      storage_symbol: "XAUUSD"
+    US10Y:
+      yf_ticker: "^TNX"
+      storage_symbol: "US10Y"
+    WTI:
+      yf_ticker: "CL=F"
+      storage_symbol: "WTI"
+    VIX:
+      yf_ticker: "^VIX"
+      storage_symbol: "VIX"
+
+  # Basket -> which driver(s) get joined into that basket's feature
+  # matrix. "crosses" (EUR/GBP/AUD/NZD only, no USD) uses VIX as a
+  # general risk-sentiment proxy rather than any single quote-currency
+  # driver, since it has no single shared quote currency.
+  basket_drivers:
+    usd: ["DXY", "GOLD", "US10Y"]
+    cad: ["WTI"]
+    chf: ["VIX"]
+    jpy: ["VIX"]
+    crosses: ["VIX"]
 
 session:
   # UTC hour ranges for the session-indicator feature — free to compute
