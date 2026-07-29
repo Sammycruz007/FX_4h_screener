@@ -26,13 +26,13 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: "requirements-cloud.txt"
+          cache-dependency-path: "requirements_cloud.txt"
 
       # ── 3. Install dependencies ───────────────────────────────────────────
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements-cloud.txt
+          pip install -r requirements_cloud.txt
 
       # ── 4. Run weekly pipeline ────────────────────────────────────────────
       - name: Run Eagle Logic pipeline
