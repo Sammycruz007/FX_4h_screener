@@ -150,12 +150,12 @@ csi:
   # EURUSD's RS = CSI_EUR - CSI_USD), computed in engines/csi.py.
   # Lookback: 20 weekly candles for the rolling return each currency's
   # strength is averaged from.
-  lookback_period: 10
+  lookback_period: 20
   # csi_diff_zscore — normalises csi_rs (CSI_base - CSI_quote) against
   # its OWN rolling history, so a pair-specific RS gap is comparable
   # across all 28 pairs regardless of each pair's typical RS-gap
   
-  zscore_window: 15
+  zscore_window: 20
   # csi_diff_roc — momentum/exhaustion on the RS gap itself: is it
   # accelerating or rolling over? Differenced over 5 weekly candles —
   # short enough to catch a genuine turn without being pure
