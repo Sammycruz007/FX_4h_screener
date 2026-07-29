@@ -1,0 +1,250 @@
+database:
+  path: data/fx_scanner.db
+
+storage:
+  # Supabase Storage (Parquet snapshots, see data/storage_cloud.py) —
+  # NOT the same as `database.path` above, which is local SQLite.
+  # Consolidation runs every pipeline execution: reads all accumulated
+  # snapshot chunks, dedupes on (pair, datetime), trims anything older
+  # than retention_days, writes one fresh consolidated file, deletes
+  # every old chunk. Bounds both total Storage bytes AND object count
+  # (Supabase free tier caps both) without ever losing in-window data
+  # free-tier 1GB cap even before accounting for Parquet compression.
+  retention_days: 9200
+
+fetcher:
+  batch_size: 25
+  max_workers: 7
+  retry_attempts: 3
+  retry_delay_seconds: 5
+  # Weekly candles (fetch_interval: "1wk") have no yfinance history cap,
+  # unlike intraday intervals. 9125 days (~25 years) is a deliberate
+  # deep-history pull for this project, not a leftover intraday-safety value.
+  historical_days: 9125
+  incremental_days: 5       # buffer for weekend/holiday gaps
+  fetch_interval: "1wk"       # what we actually pull from yfinance
+  
+
+logging:
+  backup_count: 5
+  level: INFO
+  log_dir: logs
+  max_file_size_mb: 10
+
+ml:
+  high_probability_threshold: 0.55
+  # Locked: 2 weekly candles ahead (~2 weeks forward).
+  label_forward_periods: 2
+  min_training_samples: 50
+  model_retrain_days: 7
+  # Backfill every week, no skipping.
+  backfill_stride: 1
+
+scheduler:
+  # 
+  run_times:
+  - "00:00"
+  
+  timezone: "UTC"
+
+
+# Fixed 28-pair universe — all unique combinations of the 8 major
+# currencies, standard FX quoting convention (base/quote order matches
+# m. yfinance ticker format: "EURUSD=X".
+universe:
+  pairs:
+  - EURUSD
+  - GBPUSD
+  - USDJPY
+  - USDCAD
+  - USDCHF
+  - AUDUSD
+  - NZDUSD
+  - EURGBP
+  - EURJPY
+  - EURCHF
+  - EURAUD
+  - EURNZD
+  - EURCAD
+  - GBPJPY
+  - GBPCHF
+  - GBPAUD
+  - GBPNZD
+  - GBPCAD
+  - AUDJPY
+  - AUDCHF
+  - AUDNZD
+  - AUDCAD
+  - NZDJPY
+  - NZDCHF
+  - NZDCAD
+  - CADJPY
+  - CADCHF
+  - CHFJPY
+  currencies:               # the 8 majors CSI is computed for
+  - USD
+  - EUR
+  - GBP
+  - JPY
+  - AUD
+  - NZD
+  - CAD
+  - CHF
+  # Final basket assignments — verified: all 28 pairs covered exactly
+  # once, no typos, no gaps, no duplicates.
+  baskets:
+    usd:
+    - EURUSD
+    - GBPUSD
+    - AUDUSD
+    - NZDUSD
+    cad:
+    - AUDCAD
+    - EURCAD
+    - GBPCAD
+    - NZDCAD
+    - USDCAD
+    chf:
+    - AUDCHF
+    - EURCHF
+    - GBPCHF
+    - NZDCHF
+    - CADCHF
+    - USDCHF
+    jpy:
+    - AUDJPY
+    - EURJPY
+    - GBPJPY
+    - NZDJPY
+    - CADJPY
+    - CHFJPY
+    - USDJPY
+    crosses:
+    - EURAUD
+    - GBPAUD
+    - EURNZD
+    - GBPNZD
+    - EURGBP
+    - AUDNZD
+
+adx:
+  period: 14   # Wilder's standard default — timeframe-invariant convention
+
+bollinger:
+  # Classic 20/2 baseline — the widely-used standard that generalizes
+  # well across timeframes, and matches the 20-weekly-candle lookback
+  # already used elsewhere in this config (see csi.lookback_period).
+  period: 20
+  num_std: 2
+
+momentum:
+  # Rate-of-change over 10 weekly candles (~1 quarter) — a standard
+  # swing-timeframe momentum lookback, long enough to filter noise
+  # while staying responsive within the 2-week label horizon.
+  roc_period: 10
+
+csi:
+  # Currency Strength Index — replaces Market Pulse (SPY/QQQ/DIA) and
+  # the sector-ETF-based Relative Strength from the stock projects.
+  # RS feature itself = CSI_base - CSI_quote for a given pair (e.g.
+  # EURUSD's RS = CSI_EUR - CSI_USD), computed in engines/csi.py.
+  # Lookback: 20 weekly candles for the rolling return each currency's
+  # strength is averaged from.
+  lookback_period: 20
+  # csi_diff_zscore — normalises csi_rs (CSI_base - CSI_quote) against
+  # its OWN rolling history, so a pair-specific RS gap is comparable
+  # across all 28 pairs regardless of each pair's typical RS-gap
+  
+  zscore_window: 24
+  # csi_diff_roc — momentum/exhaustion on the RS gap itself: is it
+  # accelerating or rolling over? Differenced over 5 weekly candles —
+  # short enough to catch a genuine turn without being pure
+  # single-candle noise.
+  roc_lag: 5
+
+atr:
+  # Two ATR periods, per your request — ATR_14/ATR_50 as a volatility-
+  # regime feature (ratio >1 = expanding vol, <1 = compression/squeeze).
+  # Also the basis for normalizing every distance-based feature (band
+  # width, etc.) — critical for FX specifically, since
+  # price LEVEL isn't a meaningful unit here the way it loosely is for
+  # stocks (JPY pairs quote in 2 decimals, others in 4-5).
+  fast_period: 14
+  slow_period: 50
+
+candlestick:
+  # Hammer / Shooting Star detection — hand-crafted interaction with
+  extreme_sd_threshold: 1.0
+
+rsi:
+  period: 14   # Wilder's standard default — timeframe-invariant convention
+
+macd:
+  fast_period: 12
+  slow_period: 26
+  signal_period: 9
+
+trend:
+  # SMA periods for price-vs-trend position features (price_vs_sma20,
+  # price_vs_sma50, sma_cross), matching the EURUSD reference project.
+  sma_fast: 20
+  sma_slow: 50
+
+macro:
+  # External, non-price-derived drivers — the EURUSD-only project's
+  # biggest edge came from these (DXY/10Y yield/gold), which the
+  # original basket design had none of. Mapped per basket to each
+  # quote currency's real fundamental driver, not just reused
+  # generically across all baskets.
+  #
+  # yfinance tickers:
+  #   DXY    -> "DX-Y.NYB"  (US Dollar Index)
+  #   GOLD   -> "GC=F"      (Gold futures)
+  #   US10Y  -> "^TNX"      (US 10-Year Treasury yield)
+  #   WTI    -> "CL=F"      (WTI Crude Oil futures — Canada's top export)
+  #   VIX    -> "^VIX"      (CBOE Volatility Index — safe-haven/risk-off
+  #                          proxy; used for CHF and JPY since no free,
+  #                          reliable CHF/JPY-specific yield series
+  #                          exists on yfinance, and both currencies'
+  #                          moves are driven far more by risk sentiment
+  #                          / carry-unwind flows than by their own
+  #                          domestic yield)
+  drivers:
+    DXY:
+      yf_ticker: "DX-Y.NYB"
+      storage_symbol: "DXY"
+    GOLD:
+      yf_ticker: "GC=F"
+      storage_symbol: "XAUUSD"
+    US10Y:
+      yf_ticker: "^TNX"
+      storage_symbol: "US10Y"
+    WTI:
+      yf_ticker: "CL=F"
+      storage_symbol: "WTI"
+    VIX:
+      yf_ticker: "^VIX"
+      storage_symbol: "VIX"
+
+  # Basket -> which driver(s) get joined into that basket's feature
+  # matrix. "crosses" (EUR/GBP/AUD/NZD only, no USD) uses VIX as a
+  # general risk-sentiment proxy rather than any single quote-currency
+  # driver, since it has no single shared quote currency.
+  basket_drivers:
+    usd: ["DXY", "GOLD", "US10Y"]
+    cad: ["WTI"]
+    chf: ["VIX"]
+    jpy: ["VIX"]
+    crosses: ["VIX"]
+
+session:
+  # UTC hour ranges for the session-indicator feature — free to compute
+  # from a candle's own timestamp, no new data source needed. Captures
+  # that FX behavior differs meaningfully by session (London-NY overlap
+  # = highest volatility; Asian session = often quieter/ranging).
+  tokyo_open_utc: 0
+  tokyo_close_utc: 9
+  london_open_utc: 8
+  london_close_utc: 17
+  new_york_open_utc: 13
+  new_york_close_utc: 22
