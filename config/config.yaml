@@ -17,11 +17,9 @@ fetcher:
   max_workers: 7
   retry_attempts: 3
   retry_delay_seconds: 5
-  # CRITICAL: yfinance caps 1H (60m) history at 730 calendar days — unlike
-  # daily candles, which have no such cap. This was 1800 in the carried-over
-  # config (correct for the daily-stocks project, WRONG here — would have
-  # silently failed/truncated on the very first fetch). 729 leaves a
-  # 1-day safety buffer under the actual limit.
+  # Weekly candles (fetch_interval: "1wk") have no yfinance history cap,
+  # unlike intraday intervals. 9125 days (~25 years) is a deliberate
+  # deep-history pull for this project, not a leftover intraday-safety value.
   historical_days: 9125
   incremental_days: 5       # buffer for weekend/holiday gaps
   fetch_interval: "1wk"       # what we actually pull from yfinance
@@ -35,13 +33,12 @@ logging:
 
 ml:
   high_probability_threshold: 0.55
-  # NEEDS YOUR CONFIRMATION — proposed: 30 4H-candles ≈ 5 trading days
-  # (~1 week) forward. Shorter horizon than the daily project's 60
-  # (≈3 months), matching the faster pace of a 4H timeframe.
-  label_forward_periods: 50
+  # Locked: 2 weekly candles ahead (~2 weeks forward).
+  label_forward_periods: 2
   min_training_samples: 50
   model_retrain_days: 7
-  backfill_stride: 2
+  # Backfill every week, no skipping.
+  backfill_stride: 1
 
 scheduler:
   # 
@@ -93,18 +90,66 @@ universe:
   - NZD
   - CAD
   - CHF
+  # Final basket assignments — verified: all 28 pairs covered exactly
+  # once, no typos, no gaps, no duplicates.
+  baskets:
+    usd:
+    - EURUSD
+    - GBPUSD
+    - AUDUSD
+    - NZDUSD
+    cad:
+    - AUDCAD
+    - EURCAD
+    - GBPCAD
+    - NZDCAD
+    - USDCAD
+    chf:
+    - AUDCHF
+    - EURCHF
+    - GBPCHF
+    - NZDCHF
+    - CADCHF
+    - USDCHF
+    jpy:
+    - AUDJPY
+    - EURJPY
+    - GBPJPY
+    - NZDJPY
+    - CADJPY
+    - CHFJPY
+    - USDJPY
+    crosses:
+    - EURAUD
+    - GBPAUD
+    - EURNZD
+    - GBPNZD
+    - EURGBP
+    - AUDNZD
 
 adx:
   period: 14   # Wilder's standard default — timeframe-invariant convention
+
+bollinger:
+  # Classic 20/2 baseline — the widely-used standard that generalizes
+  # well across timeframes, and matches the 20-weekly-candle lookback
+  # already used elsewhere in this config (see csi.lookback_period).
+  period: 20
+  num_std: 2
+
+momentum:
+  # Rate-of-change over 10 weekly candles (~1 quarter) — a standard
+  # swing-timeframe momentum lookback, long enough to filter noise
+  # while staying responsive within the 2-week label horizon.
+  roc_period: 10
 
 csi:
   # Currency Strength Index — replaces Market Pulse (SPY/QQQ/DIA) and
   # the sector-ETF-based Relative Strength from the stock projects.
   # RS feature itself = CSI_base - CSI_quote for a given pair (e.g.
   # EURUSD's RS = CSI_EUR - CSI_USD), computed in engines/csi.py.
-  # NEEDS YOUR CONFIRMATION — proposed lookback: 20 4H-candles (~3-4
-  # trading days) for the rolling return each currency's strength is
-  # averaged from.
+  # Lookback: 20 weekly candles for the rolling return each currency's
+  # strength is averaged from.
   lookback_period: 20
   # csi_diff_zscore — normalises csi_rs (CSI_base - CSI_quote) against
   # its OWN rolling history, so a pair-specific RS gap is comparable
@@ -112,16 +157,16 @@ csi:
   
   zscore_window: 24
   # csi_diff_roc — momentum/exhaustion on the RS gap itself: is it
-  # accelerating or rolling over? Differenced over 2 4H-candles (~8
-  # hours) — short enough to catch a genuine turn without being pure
+  # accelerating or rolling over? Differenced over 5 weekly candles —
+  # short enough to catch a genuine turn without being pure
   # single-candle noise.
   roc_lag: 5
 
 atr:
-  # Two ATR periods, per your request — ATR_14/ATR_100 as a volatility-
+  # Two ATR periods, per your request — ATR_14/ATR_50 as a volatility-
   # regime feature (ratio >1 = expanding vol, <1 = compression/squeeze).
-  # Also the basis for normalizing every distance-based feature (dist to
-  # LinReg mean, band width, etc.) — critical for FX specifically, since
+  # Also the basis for normalizing every distance-based feature (band
+  # width, etc.) — critical for FX specifically, since
   # price LEVEL isn't a meaningful unit here the way it loosely is for
   # stocks (JPY pairs quote in 2 decimals, others in 4-5).
   fast_period: 14
