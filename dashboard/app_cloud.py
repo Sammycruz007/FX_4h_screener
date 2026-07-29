@@ -46,12 +46,40 @@ WHAT'S DROPPED FROM THE STOCK PROJECT'S DASHBOARD:
 
 WHAT'S RENAMED:
    - ticker -> pair, throughout
-   - sector -> currency_bloc (screener.py's display-only bloc label,
-     e.g. "EUR/USD" or "AUD/USD (Commodity)")
-   - "date" -> "datetime" for the last-scan caption, since this project
-     scans twice daily (config.yaml's scheduler.run_times), not once —
-     a date alone doesn't tell you which of the day's two runs you're
-     looking at.
+   - "date" -> "datetime" for the last-run caption
+
+WHAT CHANGED IN THIS PASS — SECTION 2 IS A REDESIGN, NOT A RENAME:
+   The project moved from a scanner-flagged-candidate design (LinReg +
+   SMC + a slope/SD-zone gate, one Signal Ranker scoring pre-chosen
+   long/short candidates) to an unconditional, basket-grouped
+   directional-prediction design (no scanner, no candidates — every
+   pair in every basket gets an up/down probability every run, and
+   only predictions clearing the project's display threshold — e.g.
+   >=70% confidence — are ever written to Supabase at all; see
+   run_pipeline_cloud.py's STEP 9.5 and data/database_cloud.py's
+   module docstring for where that filtering happens). Concretely:
+     - read_latest_scan_results (direction="long"/"short") is GONE —
+       replaced by read_latest_prediction_results(basket=...), which
+       reads the NEW prediction_results table
+     - "Scanner Results" (Long/Short candidate tabs) is replaced by
+       "Predictions" — one section per basket, since each basket has
+       its own independently-trained model, showing pair/direction/
+       confidence rather than pair/currency_bloc/sd_position/ml_score
+     - ml_rank (a per-candidate rank) is gone — replaced by sorting on
+       confidence, since there's no candidate-ranking concept anymore
+     - currency_bloc, sd_position, has_valid_zone, ml_score — all
+       LinReg/SMC/scanner-era fields — are gone; predictions now show
+       pair, direction, up_probability, confidence
+   Section 1 (Currency Strength) and Section 3 (Model Health) needed
+   NO structural changes — CSI's per-currency z-score gauges and the
+   model-metrics table were never scanner/candidate-dependent.
+   Header/caption text updated: this project is now Weekly-timeframe,
+   not 4H, and the actual run cadence should be read from
+   scheduler.run_times in config.yaml directly rather than hardcoded
+   here — the old "twice daily (12:00 and 20:00 UTC)" caption was
+   specific to the 4H-era schedule and is very likely stale now that
+   this project predicts 2-weekly-candles-ahead; this file no longer
+   guesses at a specific cadence in its caption text.
 """
 
 import os
@@ -94,7 +122,7 @@ elif "SUPABASE_DB_URL" not in os.environ:
 from data.database_cloud import (
     initialise_database,
     read_latest_indicator_results,
-    read_latest_scan_results,
+    read_latest_prediction_results,
     read_latest_model_metrics,
 )
 
@@ -119,7 +147,8 @@ with header_col2:
     )
     st.markdown(
         "<p style='color:#9ca3af;margin-top:0;'>"
-        "LinReg Channel + Smart Money Concepts + Currency Strength Scanner — 4H"
+        "Basket-Grouped Directional Predictions — ADX + Currency Strength + "
+        "Bollinger + Momentum — Weekly"
         "</p>",
         unsafe_allow_html=True,
     )
@@ -133,9 +162,12 @@ if indicator_df.empty:
 
 latest_datetime = indicator_df["datetime"].max()
 st.caption(
-    f"Last scan: {latest_datetime} UTC — "
-    f"prices may have moved since scan time. Scans run twice daily "
-    f"(12:00 and 20:00 UTC)."
+    f"Last run: {latest_datetime} UTC — "
+    f"prices may have moved since this run. This project predicts "
+    f"direction 2 weekly candles ahead — see the deployment's "
+    f"scheduler.run_times in config.yaml for the actual run cadence "
+    f"(not hardcoded here, since it's a deployment-specific setting "
+    f"this dashboard file shouldn't need to track)."
 )
 
 BADGE = {"bullish": "🟢", "bearish": "🔴", "broken": "🟡", "unknown": "⚪"}
@@ -235,45 +267,69 @@ if not commodity_bloc_rows.empty:
 
 
 # =============================================================================
-# SECTION 2 — SCANNER RESULTS
+# SECTION 2 — PREDICTIONS (replaces Scanner Results — see module docstring)
+# One tab per basket (config.yaml's universe.baskets, read dynamically
+# so this file doesn't need editing whenever baskets are added/renamed).
+# Each basket's model is independent, so predictions are shown grouped
+# by basket rather than by long/short direction — direction is now a
+# COLUMN within each basket's table, not a separate tab, since a single
+# basket's predictions can be a mix of "up" and "down" calls.
 # =============================================================================
 
-st.header("Scanner Results")
+st.header("Predictions")
+st.caption(
+    "Only predictions clearing the display confidence threshold are "
+    "shown — see config.yaml's ml.high_probability_threshold. Each "
+    "basket has its own independently-trained model."
+)
 
-tab_long, tab_short = st.tabs(["📗 Long Candidates", "📕 Short Candidates"])
+import yaml as _yaml
 
-cols_to_show = [
-    "ml_rank", "pair", "currency_bloc", "sd_position",
-    "has_valid_zone", "ml_score",
-]
+def _load_baskets() -> dict:
+    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
+    with open(config_path, "r") as f:
+        cfg = _yaml.safe_load(f)
+    return cfg.get("universe", {}).get("baskets", {})
 
-with tab_long:
-    longs = read_latest_scan_results(direction="long")
-    if longs.empty:
-        st.info("No long candidates this run.")
-    else:
-        display_cols = [c for c in cols_to_show if c in longs.columns]
-        st.dataframe(
-            longs[display_cols].style.background_gradient(
-                subset=["ml_score"], cmap="Greens"
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+BASKETS = _load_baskets()
 
-with tab_short:
-    shorts = read_latest_scan_results(direction="short")
-    if shorts.empty:
-        st.info("No short candidates this run.")
-    else:
-        display_cols = [c for c in cols_to_show if c in shorts.columns]
-        st.dataframe(
-            shorts[display_cols].style.background_gradient(
-                subset=["ml_score"], cmap="Reds"
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+if not BASKETS:
+    st.warning(
+        "No baskets configured in config.yaml's universe.baskets — "
+        "cannot show per-basket predictions."
+    )
+else:
+    basket_tabs = st.tabs([f"📊 {name}" for name in BASKETS.keys()])
+
+    cols_to_show = ["pair", "direction", "up_probability", "confidence"]
+
+    for tab, basket_name in zip(basket_tabs, BASKETS.keys()):
+        with tab:
+            basket_predictions = read_latest_prediction_results(basket=basket_name)
+
+            if basket_predictions.empty:
+                st.info(
+                    f"No predictions cleared the display threshold for "
+                    f"{basket_name} this run."
+                )
+                continue
+
+            display_cols = [c for c in cols_to_show if c in basket_predictions.columns]
+
+            # Colour by direction: green background for "up" rows, red
+            # for "down" — background_gradient alone (as the old
+            # ml_score-based version used) doesn't make sense here since
+            # up/down calls need visually distinct treatment, not just a
+            # single-direction intensity gradient.
+            def _highlight_direction(row):
+                color = "#14532d" if row.get("direction") == "up" else "#7f1d1d"
+                return [f"background-color: {color}"] * len(row)
+
+            st.dataframe(
+                basket_predictions[display_cols].style.apply(_highlight_direction, axis=1),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 # =============================================================================
