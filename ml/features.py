@@ -54,6 +54,27 @@ WHAT'S KEPT, UNCHANGED (none of these ever depended on LinReg or SMC):
      (see "WHAT'S DROPPED" above for why the gating is gone but the
      underlying pattern detection isn't).
 
+ADDED (per project decision, after comparing against the EURUSD-only
+reference project's 0.76-AUC feature set — this basket redesign had
+originally dropped several of its core signal families without a
+deliberate decision to do so):
+   - rsi (Wilder RSI, own-pair) + rsi_oversold / rsi_overbought flags
+     — was a top feature in the reference project; had no LinReg/SMC
+     dependency and should never have been dropped.
+   - macd / macd_signal / macd_hist — same reasoning as RSI.
+   - price_vs_sma20 / price_vs_sma50 / sma_cross — trend-position
+     features, direction-independent, no LinReg dependency (LinReg was
+     a regression channel; a plain SMA is not that).
+   - up_streak / down_streak / vol_expanding — regime/streak features
+     from the reference project, direction-independent.
+   - MACRO FEATURES (genuinely new, not a restoration): per-basket
+     external drivers — DXY/gold/US10Y for the usd basket, WTI for
+     cad, VIX for chf/jpy/crosses (config.yaml's macro.basket_drivers).
+     See engines/macro.py. This is the one category of feature the
+     reference project's edge relied on that this project never had
+     an equivalent for at all (CSI is cross-pair but still fully
+     internal to the 28-pair universe's own price action).
+
 TIMEFRAME NOTE: this project moved from 4H bars to native Weekly bars
 (see data/fetcher.py's module docstring). ATR_FAST_PERIOD/
 ATR_SLOW_PERIOD and the session-hour boundaries are still read from
@@ -79,6 +100,7 @@ from utils.error_handler import graceful, MLError
 from engines.adx import compute_adx_latest
 from engines.csi import run_csi_engine
 from engines.candlestick import compute_raw_pattern_flags
+from engines.macro import get_macro_features_for_basket
 
 logger = get_ml_logger()
 
@@ -97,6 +119,10 @@ ATR_CFG     = config["atr"]
 SESSION_CFG = config["session"]
 BOLLINGER_CFG = config["bollinger"]
 MOMENTUM_CFG  = config["momentum"]
+RSI_CFG       = config["rsi"]
+MACD_CFG      = config["macd"]
+TREND_CFG     = config["trend"]
+UNIVERSE_CFG  = config["universe"]
 
 ATR_FAST_PERIOD = ATR_CFG["fast_period"]
 ATR_SLOW_PERIOD = ATR_CFG["slow_period"]
@@ -120,6 +146,53 @@ BOLLINGER_NUM_STD   = BOLLINGER_CFG["num_std"]
 # on weekly bars), matching the reference EURUSD project's short-
 # horizon momentum feel.
 ROC_PERIOD = MOMENTUM_CFG["roc_period"]
+
+# RSI — Wilder's standard period, timeframe-invariant convention.
+RSI_PERIOD = RSI_CFG["period"]
+
+# MACD — standard 12/26/9, timeframe-invariant convention.
+MACD_FAST_PERIOD   = MACD_CFG["fast_period"]
+MACD_SLOW_PERIOD   = MACD_CFG["slow_period"]
+MACD_SIGNAL_PERIOD = MACD_CFG["signal_period"]
+
+# Trend/SMA position — matches the reference EURUSD project's
+# price_vs_sma20 / price_vs_sma50 / sma_cross features.
+SMA_FAST_PERIOD = TREND_CFG["sma_fast"]
+SMA_SLOW_PERIOD = TREND_CFG["sma_slow"]
+
+# pair -> basket name lookup, built once from config.yaml's
+# universe.baskets, so compute_directional_features can find which
+# basket (and therefore which macro drivers) a given pair belongs to
+# without the caller needing to pass it explicitly every time.
+_PAIR_TO_BASKET = {
+    pair: basket_name
+    for basket_name, pairs in UNIVERSE_CFG["baskets"].items()
+    for pair in pairs
+}
+
+# basket -> expected macro feature column names, e.g.
+# "usd" -> ["dxy_return", "dxy_return_4wk", "dxy_above_sma20",
+#           "dxy_rsi", "gold_return", ..., "us10y_rsi"].
+# Built once from config.yaml's macro.basket_drivers + macro.drivers,
+# matching the column-naming convention engines/macro.py's
+# get_macro_features_for_basket() produces (add_prefix with the
+# lowercased driver storage_symbol). Used so every row for a given
+# basket has the SAME macro columns present (falling back to 0.0),
+# even on datetimes where macro_features_df has no as-of row yet.
+MACRO_CFG          = config["macro"]
+_MACRO_DRIVERS     = MACRO_CFG["drivers"]
+_MACRO_BASKET_MAP  = MACRO_CFG["basket_drivers"]
+_MACRO_FEATURE_SUFFIXES = ["return", "return_4wk", "above_sma20", "rsi"]
+
+MACRO_FEATURE_COLS_BY_BASKET = {
+    basket_name: [
+        f"{_MACRO_DRIVERS[driver_symbol]['storage_symbol'].lower()}_{suffix}"
+        for driver_symbol in driver_symbols
+        if driver_symbol in _MACRO_DRIVERS
+        for suffix in _MACRO_FEATURE_SUFFIXES
+    ]
+    for basket_name, driver_symbols in _MACRO_BASKET_MAP.items()
+}
 
 
 # =============================================================================
@@ -266,6 +339,153 @@ def _compute_roc(px: pd.DataFrame) -> float:
 
 
 # =============================================================================
+# RSI, MACD, SMA-TREND, REGIME/STREAK FEATURES
+# Restored from the EURUSD reference project — none of these ever
+# depended on LinReg or SMC, and their absence from the original
+# basket redesign was an oversight, not a deliberate scope decision
+# (see module docstring's "ADDED" section).
+# =============================================================================
+
+def _compute_rsi(px: pd.DataFrame, period: int = RSI_PERIOD) -> float:
+    """
+    Standard Wilder RSI on this pair's own close series.
+
+    Returns:
+        RSI value (0-100). Falls back to 50.0 (neutral) if fewer than
+        period+1 candles are available.
+    """
+    close = px["close"]
+    if len(close) < period + 1:
+        return 50.0
+
+    delta = close.diff()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    latest_avg_gain = avg_gain.iloc[-1]
+    latest_avg_loss = avg_loss.iloc[-1]
+
+    if pd.isna(latest_avg_gain) or pd.isna(latest_avg_loss):
+        return 50.0
+    if latest_avg_loss == 0:
+        return 100.0 if latest_avg_gain > 0 else 50.0
+
+    rs  = latest_avg_gain / latest_avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return float(rsi)
+
+
+def _compute_macd(px: pd.DataFrame) -> dict:
+    """
+    Standard MACD: EMA_fast - EMA_slow, signal = EMA of MACD line,
+    histogram = MACD - signal.
+
+    Returns:
+        Dict with macd, macd_signal, macd_hist. Falls back to all
+        0.0 (neutral — no trend signal) if fewer than
+        MACD_SLOW_PERIOD + MACD_SIGNAL_PERIOD candles are available.
+    """
+    close = px["close"]
+    min_required = MACD_SLOW_PERIOD + MACD_SIGNAL_PERIOD
+    if len(close) < min_required:
+        return {"macd": 0.0, "macd_signal": 0.0, "macd_hist": 0.0}
+
+    ema_fast   = close.ewm(span=MACD_FAST_PERIOD, adjust=False).mean()
+    ema_slow   = close.ewm(span=MACD_SLOW_PERIOD, adjust=False).mean()
+    macd_line  = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=MACD_SIGNAL_PERIOD, adjust=False).mean()
+    hist        = macd_line - signal_line
+
+    return {
+        "macd"       : float(macd_line.iloc[-1]),
+        "macd_signal": float(signal_line.iloc[-1]),
+        "macd_hist"  : float(hist.iloc[-1]),
+    }
+
+
+def _compute_sma_trend(px: pd.DataFrame) -> dict:
+    """
+    Price-vs-trend position: how far current close sits above/below
+    its own SMA_FAST/SMA_SLOW, expressed as a fraction of price (not
+    raw price units — FX pairs quote at very different decimal scales,
+    e.g. JPY pairs in 2 decimals vs. others in 4-5, so a raw price
+    difference isn't comparable across pairs the way a % difference is).
+
+    Returns:
+        Dict with price_vs_sma20, price_vs_sma50 (both fractional,
+        e.g. 0.01 = 1% above the SMA), and sma_cross (1 if the fast
+        SMA is above the slow SMA, else 0 — a simple trend-direction
+        flag). Falls back to 0.0 / 0.0 / 0 if insufficient history for
+        either SMA.
+    """
+    close = px["close"]
+    current_close = close.iloc[-1]
+
+    if len(close) < SMA_FAST_PERIOD:
+        price_vs_sma20 = 0.0
+    else:
+        sma20 = close.tail(SMA_FAST_PERIOD).mean()
+        price_vs_sma20 = float((current_close - sma20) / sma20) if sma20 > 0 else 0.0
+
+    if len(close) < SMA_SLOW_PERIOD:
+        price_vs_sma50 = 0.0
+        sma_cross      = 0
+    else:
+        sma20_for_cross = close.tail(SMA_FAST_PERIOD).mean()
+        sma50           = close.tail(SMA_SLOW_PERIOD).mean()
+        price_vs_sma50  = float((current_close - sma50) / sma50) if sma50 > 0 else 0.0
+        sma_cross       = int(sma20_for_cross > sma50)
+
+    return {
+        "price_vs_sma20": price_vs_sma20,
+        "price_vs_sma50": price_vs_sma50,
+        "sma_cross"      : sma_cross,
+    }
+
+
+def _compute_regime_flags(px: pd.DataFrame, rsi_value: float, atr_fast: float, atr_slow: float) -> dict:
+    """
+    Regime/streak features from the reference project: how extended is
+    the current move, not just its raw indicator value.
+
+    Returns:
+        Dict with:
+        - up_streak / down_streak: consecutive up/down closes ending
+          at the latest candle (one of these is always 0)
+        - rsi_oversold / rsi_overbought: 1/0 flags at the conventional
+          30/70 RSI thresholds
+        - vol_expanding: 1 if atr_fast > atr_slow (volatility currently
+          expanding vs. its own slower baseline), else 0
+    """
+    closes = px["close"].values
+    up_streak   = 0
+    down_streak = 0
+
+    for i in range(len(closes) - 1, 0, -1):
+        if closes[i] > closes[i - 1]:
+            if down_streak > 0:
+                break
+            up_streak += 1
+        elif closes[i] < closes[i - 1]:
+            if up_streak > 0:
+                break
+            down_streak += 1
+        else:
+            break
+
+    return {
+        "up_streak"      : up_streak,
+        "down_streak"    : down_streak,
+        "rsi_oversold"   : int(rsi_value <= 30),
+        "rsi_overbought" : int(rsi_value >= 70),
+        "vol_expanding"  : int(atr_fast > atr_slow) if atr_slow > 0 else 0,
+    }
+
+
+# =============================================================================
 # SESSION INDICATOR
 # Unchanged from the prior version — derived purely from the candle's
 # own UTC timestamp, no engine dependency at all.
@@ -312,6 +532,7 @@ def compute_directional_features(
     signal_datetime,
     prices_df     : pd.DataFrame,
     csi_df        : Optional[pd.DataFrame] = None,
+    macro_features_df: Optional[pd.DataFrame] = None,
 ) -> Optional[dict]:
     """
     Compute all features for the directional model for a single
@@ -349,6 +570,27 @@ def compute_directional_features(
     the reference project's README:
     - roc : (close[t] - close[t-ROC_PERIOD]) / close[t-ROC_PERIOD]
 
+    GROUP 8 — RSI (3 features): restored from the reference project.
+    - rsi, rsi_oversold, rsi_overbought
+
+    GROUP 9 — MACD (3 features): restored from the reference project.
+    - macd, macd_signal, macd_hist
+
+    GROUP 10 — SMA trend position (3 features): restored from the
+    reference project.
+    - price_vs_sma20, price_vs_sma50, sma_cross
+
+    GROUP 11 — Regime/streak (3 features): restored from the
+    reference project.
+    - up_streak, down_streak, vol_expanding
+
+    GROUP 12 — Macro drivers (variable count per basket): NEW, per
+    project decision — external, non-price-derived features mapped to
+    this pair's basket (e.g. dxy_return, gold_rsi for usd-basket
+    pairs; wti_return for cad-basket pairs). See engines/macro.py.
+    Falls back to 0.0 for every configured driver column if
+    macro_features_df is not provided or has no row for this datetime.
+
     Args:
         pair           : FX pair symbol e.g. 'EURUSD'
         signal_datetime: Timestamp of the signal (UTC)
@@ -361,6 +603,12 @@ def compute_directional_features(
                          per pair (CSI is inherently cross-pair). Falls
                          back to 0.0 for all 4 CSI features if not
                          provided or pair not found.
+        macro_features_df: Output of engines.macro.get_macro_features_for_basket()
+                         for THIS pair's basket — pre-computed once per
+                         basket per training run (mirrors how csi_df is
+                         pre-computed once for the whole universe), not
+                         recomputed per pair. Columns are looked up by
+                         nearest datetime <= signal_datetime.
 
     Returns:
         Dict of all features or None if insufficient data
@@ -454,6 +702,42 @@ def compute_directional_features(
     # vs. the rate of change of the CSI relative-strength gap).
     price_roc = _compute_roc(px)
 
+    # ── GROUP 8: RSI ─────────────────────────────────────────────────────────
+    rsi_value = _compute_rsi(px)
+
+    # ── GROUP 9: MACD ────────────────────────────────────────────────────────
+    macd_result = _compute_macd(px)
+
+    # ── GROUP 10: SMA trend position ────────────────────────────────────────
+    sma_trend = _compute_sma_trend(px)
+
+    # ── GROUP 11: Regime/streak flags ───────────────────────────────────────
+    regime_flags = _compute_regime_flags(px, rsi_value, atr_fast, atr_slow)
+
+    # ── GROUP 12: Macro drivers (per this pair's basket) ────────────────────
+    # Falls back to 0.0 for every driver column this pair's basket is
+    # configured for (see config.yaml's macro.basket_drivers), rather
+    # than silently omitting the columns — keeps DIRECTIONAL_FEATURE_COLS
+    # consistent across every row regardless of macro data availability.
+    basket_name    = _PAIR_TO_BASKET.get(pair)
+    macro_features = {}
+
+    if basket_name is not None:
+        expected_macro_cols = MACRO_FEATURE_COLS_BY_BASKET.get(basket_name, [])
+
+        if macro_features_df is not None and not macro_features_df.empty:
+            macro_asof = macro_features_df[macro_features_df.index <= signal_datetime]
+            if not macro_asof.empty:
+                latest_macro_row = macro_asof.iloc[-1]
+                for col in expected_macro_cols:
+                    val = latest_macro_row.get(col, np.nan)
+                    macro_features[col] = float(val) if pd.notna(val) else 0.0
+
+        # Fill in 0.0 for any expected column not populated above
+        # (no macro_features_df provided, or no row as-of this date yet).
+        for col in expected_macro_cols:
+            macro_features.setdefault(col, 0.0)
+
     # ── Assemble all features ─────────────────────────────────────────────────
     features = {
         # Identifiers (not used in training — dropped before fit)
@@ -489,6 +773,29 @@ def compute_directional_features(
 
         # Group 7: Rate of Change (momentum)
         "price_roc"          : round(price_roc, 6),
+
+        # Group 8: RSI
+        "rsi"                : round(rsi_value, 4),
+
+        # Group 9: MACD
+        "macd"               : round(macd_result["macd"],        6),
+        "macd_signal"        : round(macd_result["macd_signal"], 6),
+        "macd_hist"          : round(macd_result["macd_hist"],   6),
+
+        # Group 10: SMA trend position
+        "price_vs_sma20"     : round(sma_trend["price_vs_sma20"], 6),
+        "price_vs_sma50"     : round(sma_trend["price_vs_sma50"], 6),
+        "sma_cross"          : sma_trend["sma_cross"],
+
+        # Group 11: Regime/streak flags
+        "up_streak"          : regime_flags["up_streak"],
+        "down_streak"        : regime_flags["down_streak"],
+        "rsi_oversold"       : regime_flags["rsi_oversold"],
+        "rsi_overbought"     : regime_flags["rsi_overbought"],
+        "vol_expanding"      : regime_flags["vol_expanding"],
+
+        # Group 12: Macro drivers (per basket — column set varies)
+        **{col: round(val, 6) for col, val in macro_features.items()},
     }
 
     return features
@@ -505,6 +812,7 @@ def build_directional_feature_matrix(
     prices_df    : pd.DataFrame,
     labels_df    : pd.DataFrame,
     csi_series_df: Optional[pd.DataFrame] = None,
+    macro_features_by_basket: Optional[dict[str, pd.DataFrame]] = None,
 ) -> pd.DataFrame:
     """
     Build the full feature matrix for training a directional model.
@@ -518,6 +826,15 @@ def build_directional_feature_matrix(
                         full historical CSI series for all pairs. If
                         None, all 4 CSI features default to 0.0 for
                         every training example (logged as a warning).
+        macro_features_by_basket: Dict mapping basket name -> output of
+                        engines.macro.get_macro_features_for_basket()
+                        for that basket, e.g. {"usd": <df>, "cad": <df>,
+                        ...} — computed ONCE per basket per training
+                        run (mirrors csi_series_df's "compute once for
+                        the whole universe" pattern), not recomputed
+                        per row. If None, all macro features default to
+                        0.0 for every training example (logged as a
+                        warning).
 
     Returns:
         DataFrame with one row per labelled example, ready for model
@@ -534,6 +851,14 @@ def build_directional_feature_matrix(
             "build_directional_feature_matrix: no csi_series_df provided — "
             "all 4 CSI features will be 0.0 for all training examples"
         )
+
+    if not macro_features_by_basket:
+        logger.warning(
+            "build_directional_feature_matrix: no macro_features_by_basket "
+            "provided — all macro driver features will be 0.0 for all "
+            "training examples"
+        )
+        macro_features_by_basket = {}
 
     # ── Normalise ALL datetime columns ONCE, here, before the loop ─────────
     # Same class of bug this project has hit twice already (silent
@@ -554,6 +879,21 @@ def build_directional_feature_matrix(
     labels_df = _normalise_dt(labels_df)
     if csi_series_df is not None and not csi_series_df.empty:
         csi_series_df = _normalise_dt(csi_series_df)
+
+    # Macro feature DataFrames are indexed by datetime (not a column —
+    # see engines/macro.py's get_macro_features_for_basket), so they
+    # need index normalisation rather than the column-based helper above.
+    normalised_macro_by_basket = {}
+    for basket_name, macro_df in macro_features_by_basket.items():
+        if macro_df is None or macro_df.empty:
+            normalised_macro_by_basket[basket_name] = macro_df
+            continue
+        macro_df = macro_df.copy()
+        if not pd.api.types.is_datetime64_any_dtype(macro_df.index):
+            macro_df.index = pd.to_datetime(macro_df.index, utc=True).tz_localize(None)
+        elif isinstance(macro_df.index.dtype, pd.DatetimeTZDtype):
+            macro_df.index = macro_df.index.tz_localize(None)
+        normalised_macro_by_basket[basket_name] = macro_df
 
     rows   = []
     failed = 0
@@ -576,11 +916,15 @@ def build_directional_feature_matrix(
         if csi_series_df is not None and not csi_series_df.empty:
             csi_snapshot = csi_series_df[csi_series_df["datetime"] == dt]
 
+        basket_name = _PAIR_TO_BASKET.get(pair)
+        macro_snapshot = normalised_macro_by_basket.get(basket_name) if basket_name else None
+
         features = compute_directional_features(
             pair            = pair,
             signal_datetime = dt,
             prices_df       = px,
             csi_df          = csi_snapshot,
+            macro_features_df = macro_snapshot,
         )
 
         if features is None:
@@ -608,7 +952,22 @@ def build_directional_feature_matrix(
 # FEATURE COLUMNS — used at both train and inference time
 # =============================================================================
 
-DIRECTIONAL_FEATURE_COLS = [
+# =============================================================================
+# FEATURE COLUMNS — used at both train and inference time
+# =============================================================================
+# NOTE ON MACRO COLUMNS: unlike every other feature group, macro
+# columns are NOT the same across all 5 basket models — the usd
+# basket gets 12 macro columns (DXY+GOLD+US10Y × 4 features each),
+# while cad/chf/jpy/crosses each get 4 (their single driver × 4
+# features). A single flat DIRECTIONAL_FEATURE_COLS list would either
+# be wrong for the usd model (missing 8 columns) or wrong for every
+# other model (8 columns of zeros that don't correspond to anything
+# real for that basket). get_directional_feature_cols(basket_name)
+# below is the correct way to get a basket's column set — train_models.py
+# and any inference code should call it per-basket rather than using
+# a single shared constant.
+
+_BASE_DIRECTIONAL_FEATURE_COLS = [
     # Volatility regime
     "atr_fast",
     "atr_slow",
@@ -635,4 +994,47 @@ DIRECTIONAL_FEATURE_COLS = [
     "bollinger_bandwidth",
     # Rate of Change (momentum)
     "price_roc",
+    # RSI (restored from the reference project)
+    "rsi",
+    "rsi_oversold",
+    "rsi_overbought",
+    # MACD (restored from the reference project)
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    # SMA trend position (restored from the reference project)
+    "price_vs_sma20",
+    "price_vs_sma50",
+    "sma_cross",
+    # Regime/streak flags (restored from the reference project)
+    "up_streak",
+    "down_streak",
+    "vol_expanding",
 ]
+
+
+def get_directional_feature_cols(basket_name: str) -> list[str]:
+    """
+    Return the full ordered feature-column list for a given basket's
+    model — the shared base columns (identical across every basket)
+    plus that basket's specific macro driver columns (which differ per
+    basket — see the module-level note above).
+
+    Args:
+        basket_name: e.g. "usd", "cad", "chf", "jpy", "crosses"
+
+    Returns:
+        List of column names, in the same order compute_directional_features
+        produces them, for use as the X columns when training or
+        scoring this basket's model.
+    """
+    macro_cols = MACRO_FEATURE_COLS_BY_BASKET.get(basket_name, [])
+    return _BASE_DIRECTIONAL_FEATURE_COLS + macro_cols
+
+
+# Kept for any existing caller that imports this name directly — this
+# is ONLY the shared base set and does NOT include any basket's macro
+# columns. New code (train_models.py, inference) should call
+# get_directional_feature_cols(basket_name) instead, which returns the
+# correct full set for a specific basket.
+DIRECTIONAL_FEATURE_COLS = _BASE_DIRECTIONAL_FEATURE_COLS
