@@ -288,8 +288,8 @@ def train_directional_model(
         f"{basket_name}: cross-validation | "
         f"AUC-ROC: {cv_auc_roc.mean():.4f} +/- {cv_auc_roc.std():.4f} | "
         f"PR-AUC:  {cv_pr_auc.mean():.4f} +/- {cv_pr_auc.std():.4f}"
-        f"PR-AUC:  {cv_precision.mean():.4f} +/- {cv_precision.std():.4f}"
-        f"PR-AUC:  {cv_recall.mean():.4f} +/- {cv_recall.std():.4f}"
+        f"Precision:  {cv_precision.mean():.4f} +/- {cv_precision.std():.4f}"
+        f"Recall:  {cv_recall.mean():.4f} +/- {cv_recall.std():.4f}"
     )
 
     logger.info(f"{basket_name}: training final model on TRAIN set only...")
