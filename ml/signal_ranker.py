@@ -96,7 +96,7 @@ MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
 # now that LinReg (which used to size it) is dropped.
 SAFETY_GAP = HORIZON + 5
 
-EVAL_THRESHOLDS = sorted(set([0.5, 0.6, 0.7, 0.8, DISPLAY_THRESHOLD]))
+EVAL_THRESHOLDS = sorted(set([0.6, 0.65,0.68, 0.7, 0.8, DISPLAY_THRESHOLD]))
 
 
 # =============================================================================
