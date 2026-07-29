@@ -173,7 +173,7 @@ def _build_pipeline(scale_pos_weight: float = 1.0) -> Pipeline:
         random_state       = 42,
         n_jobs             = -1,
     )
-    inner_cv = TimeSeriesSplit(n_split= 2, gap = SAFETY_GAP)
+    inner_cv = TimeSeriesSplit(n_splits= 2, gap = SAFETY_GAP)
     calibrated_model = CalibratedClassifierCV(
         estimator = base_model,
         method    = "isotonic",
