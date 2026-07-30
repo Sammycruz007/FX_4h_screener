@@ -73,13 +73,27 @@ WHAT CHANGED IN THIS PASS — SECTION 2 IS A REDESIGN, NOT A RENAME:
    Section 1 (Currency Strength) and Section 3 (Model Health) needed
    NO structural changes — CSI's per-currency z-score gauges and the
    model-metrics table were never scanner/candidate-dependent.
-   Header/caption text updated: this project is now Weekly-timeframe,
-   not 4H, and the actual run cadence should be read from
-   scheduler.run_times in config.yaml directly rather than hardcoded
-   here — the old "twice daily (12:00 and 20:00 UTC)" caption was
-   specific to the 4H-era schedule and is very likely stale now that
-   this project predicts 2-weekly-candles-ahead; this file no longer
-   guesses at a specific cadence in its caption text.
+
+WHAT CHANGED IN THIS PASS — DAILY TIMEFRAME, LATEST-CANDLE CAPTION:
+   The project moved from Weekly to Daily bars (config.yaml's
+   fetcher.fetch_interval), and label_forward_periods now means "2
+   business days ahead," not "2 weekly candles ahead." The header
+   caption previously showed indicator_results' latest datetime as a
+   generic "Last run" timestamp — this was misleading twice over: (1)
+   it's a scan-completion time, not the underlying candle's date, and
+   (2) "last run" invites the reader to wonder how stale the run is,
+   when what actually matters for trading is how stale the PRICE DATA
+   is and whether the prediction it produced has already expired. The
+   caption now reads the fetch_tracker table directly (via
+   data.database_cloud.get_last_fetch_dates_bulk(), already used
+   elsewhere in this project for the same table) and shows the actual
+   latest fetched candle date plus its computed validity window (candle
+   date + 2 business days, matching label_forward_periods=2 on daily
+   bars) — e.g. "Latest candle: 2026-07-29 — valid through 2026-07-31
+   (expires 2026-08-01)". If different pairs somehow show different
+   last_fetch_date values (a partial fetch failure), the caption shows
+   the OLDEST one and warns, rather than silently reporting the newest
+   and hiding that some pairs are stale.
 """
 
 import os
@@ -124,6 +138,7 @@ from data.database_cloud import (
     read_latest_indicator_results,
     read_latest_prediction_results,
     read_latest_model_metrics,
+    get_last_fetch_dates_bulk,
 )
 
 # ── Initialise DB tables (safe — IF NOT EXISTS) ───────────────────────────────
@@ -148,7 +163,7 @@ with header_col2:
     st.markdown(
         "<p style='color:#9ca3af;margin-top:0;'>"
         "Basket-Grouped Directional Predictions — ADX + Currency Strength + "
-        "Bollinger + Momentum — Weekly"
+        "Bollinger + Momentum"
         "</p>",
         unsafe_allow_html=True,
     )
@@ -160,15 +175,81 @@ if indicator_df.empty:
     st.warning("No scan data yet. Pipeline has not run or Supabase is empty.")
     st.stop()
 
-latest_datetime = indicator_df["datetime"].max()
-st.caption(
-    f"Last run: {latest_datetime} UTC — "
-    f"prices may have moved since this run. This project predicts "
-    f"direction 2 weekly candles ahead — see the deployment's "
-    f"scheduler.run_times in config.yaml for the actual run cadence "
-    f"(not hardcoded here, since it's a deployment-specific setting "
-    f"this dashboard file shouldn't need to track)."
-)
+# ── Latest candle date + validity window ──────────────────────────────────
+# Replaces the old "Last run: <indicator_results timestamp> UTC" caption.
+# That showed when the SCAN completed, not when the underlying PRICE
+# DATA is actually from — misleading for judging whether a prediction
+# is still actionable. This reads fetch_tracker directly (the same
+# table/function data/fetcher.py itself writes to and reads from) to
+# show the real latest candle date, plus how long that candle's
+# prediction remains valid (label_forward_periods business days ahead
+# on daily bars — see config.yaml's ml.label_forward_periods).
+import datetime as _datetime
+
+def _add_business_days(start_date: _datetime.date, n: int) -> _datetime.date:
+    """Add n business days (Mon-Fri) to start_date, skipping weekends —
+    matches FX market closure, consistent with how label_direction()
+    itself must skip non-trading days when building the 2-day-ahead
+    label this validity window is meant to mirror."""
+    current = start_date
+    added   = 0
+    while added < n:
+        current += _datetime.timedelta(days=1)
+        if current.weekday() < 5:  # Mon=0 ... Fri=4
+            added += 1
+    return current
+
+LABEL_FORWARD_PERIODS = 2  # matches config.yaml's ml.label_forward_periods
+                            # (daily bars: "2 business days ahead")
+
+fetch_dates = get_last_fetch_dates_bulk()  # {pair: "YYYY-MM-DD"}
+
+if not fetch_dates:
+    st.caption("Latest candle date unavailable — fetch_tracker is empty.")
+else:
+    parsed_dates = {
+        pair: _datetime.date.fromisoformat(date_str)
+        for pair, date_str in fetch_dates.items()
+    }
+    oldest_date  = min(parsed_dates.values())
+    newest_date  = max(parsed_dates.values())
+
+    # valid_through = the Nth business day itself (the last day the
+    # prediction still covers). expires_on = the calendar day
+    # immediately after valid_through (the exclusive boundary — once
+    # this date arrives, a fresh candle/prediction should exist and
+    # the old one should no longer be acted on).
+    valid_through = _add_business_days(oldest_date, LABEL_FORWARD_PERIODS)
+    expires_on    = valid_through + _datetime.timedelta(days=1)
+
+    if oldest_date == newest_date:
+        st.caption(
+            f"📅 Latest candle: **{oldest_date.isoformat()}** — "
+            f"valid through **{valid_through.isoformat()}** "
+            f"(expires {expires_on.isoformat()}). "
+            f"Predicts {LABEL_FORWARD_PERIODS} business days ahead."
+        )
+    else:
+        # Pairs disagree on last_fetch_date — a partial fetch failure
+        # somewhere. Show the OLDEST (most conservative/limiting) date
+        # as the basis for validity, and warn explicitly rather than
+        # silently reporting the newest and hiding that some pairs are
+        # running on stale data.
+        stale_pairs = [p for p, d in parsed_dates.items() if d == oldest_date]
+        st.caption(
+            f"📅 Latest candle: **{oldest_date.isoformat()}** to "
+            f"**{newest_date.isoformat()}** (pairs disagree — "
+            f"{len(stale_pairs)} pair(s) on the oldest date) — "
+            f"valid through **{valid_through.isoformat()}** "
+            f"(expires {expires_on.isoformat()}), based on the OLDEST "
+            f"fetched pair. Predicts {LABEL_FORWARD_PERIODS} business "
+            f"days ahead."
+        )
+        st.warning(
+            f"⚠️ {len(stale_pairs)} pair(s) have an older last_fetch_date "
+            f"than the rest — their predictions may be based on stale "
+            f"data: {', '.join(sorted(stale_pairs))}"
+        )
 
 BADGE = {"bullish": "🟢", "bearish": "🔴", "broken": "🟡", "unknown": "⚪"}
 
@@ -343,19 +424,44 @@ metrics = read_latest_model_metrics()
 if metrics.empty:
     st.info("ML models not trained yet.")
 else:
-    mcols = st.columns(2)
-    for i, row in metrics.iterrows():
-        with mcols[i % 2]:
-            st.subheader(row["model_name"])
-            st.metric("Precision", f"{row['precision_score']:.2%}")
-            st.metric("AUC-ROC",   f"{row['auc_roc_score']:.3f}")
+    # Table form, one row per basket model — replaces the previous
+    # per-model st.metric() card grid, which took much more vertical
+    # space to show the same numbers and made cross-basket comparison
+    # (e.g. "which basket has the best AUC-ROC?") harder than a plain
+    # table with sortable columns.
+    display_cols = {
+        "model_name"     : "Model",
+        "precision_score": "Precision",
+        "auc_roc_score"  : "AUC-ROC",
+        "recall_score"   : "Recall",
+        "pr_auc_score"   : "PR-AUC",
+        "train_date"     : "Trained",
+        "n_samples"      : "Samples",
+    }
+    # Only include columns that actually exist in this deployment's
+    # model_metrics table — recall_score/pr_auc_score weren't always
+    # populated for every model run historically.
+    available_cols = [c for c in display_cols if c in metrics.columns]
 
-            if "recall_score" in row and pd.notna(row.get("recall_score")):
-                st.metric("Recall", f"{row['recall_score']:.2%}")
-            if "pr_auc_score" in row and pd.notna(row.get("pr_auc_score")):
-                st.metric("PR-AUC", f"{row['pr_auc_score']:.3f}")
+    health_table = metrics[available_cols].rename(columns=display_cols)
 
-            st.caption(
-                f"Trained: {row['train_date']} | "
-                f"Samples: {row['n_samples']}"
-            )
+    # Format percentage-style columns as readable strings; leave
+    # numeric AUC/PR-AUC as plain floats (already 0-1 scale, not a %).
+    if "Precision" in health_table.columns:
+        health_table["Precision"] = health_table["Precision"].map(
+            lambda v: f"{v:.2%}" if pd.notna(v) else "—"
+        )
+    if "Recall" in health_table.columns:
+        health_table["Recall"] = health_table["Recall"].map(
+            lambda v: f"{v:.2%}" if pd.notna(v) else "—"
+        )
+    if "AUC-ROC" in health_table.columns:
+        health_table["AUC-ROC"] = health_table["AUC-ROC"].map(
+            lambda v: f"{v:.3f}" if pd.notna(v) else "—"
+        )
+    if "PR-AUC" in health_table.columns:
+        health_table["PR-AUC"] = health_table["PR-AUC"].map(
+            lambda v: f"{v:.3f}" if pd.notna(v) else "—"
+        )
+
+    st.dataframe(health_table, hide_index=True, use_container_width=True)
