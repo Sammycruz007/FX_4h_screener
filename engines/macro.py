@@ -42,9 +42,13 @@ LOGICAL FLOW:
 STEP 1 — Per-driver feature computation (generic, symbol-agnostic):
    For a single macro driver's own OHLC history:
      macro_return       : 1-candle % return (close/close.shift(1) - 1)
-     macro_return_4wk   : 4-weekly-candle % return — a slower-moving
-                          trend read, roughly comparable in spirit to
-                          the reference project's 5d/10d ROC pairing
+     macro_return_short : 1-weekly-candle % return (close/close.shift(1) - 1)
+                          — matches the EURUSD reference project's
+                          return_1d, same 1-candle lag, weekly instead
+                          of daily
+     macro_return_long  : 5-weekly-candle % return — matches the
+                          reference project's return_5d, same 5-candle
+                          lag, weekly instead of daily
      macro_above_sma20  : 1 if close > its own 20-period SMA else 0 —
                           "is this driver in an uptrend right now"
      macro_rsi          : driver's own 14-period RSI — is the driver
@@ -66,9 +70,9 @@ STEP 2 — Per-basket assembly:
    datetime without any per-basket special-casing.
 
 OUTPUT (per driver, per timestamp):
-   {symbol}_return, {symbol}_return_4wk, {symbol}_above_sma20,
+   {symbol}_return_short, {symbol}_return_long, {symbol}_above_sma20,
    {symbol}_rsi — all lowercased driver symbol as prefix, e.g.
-   "dxy_return", "vix_rsi".
+   "dxy_return_short", "vix_rsi".
 """
 
 import numpy as np
@@ -98,9 +102,18 @@ MACRO_CFG   = config["macro"]
 DRIVERS         = MACRO_CFG["drivers"]         # {"DXY": {...}, "GOLD": {...}, ...}
 BASKET_DRIVERS  = MACRO_CFG["basket_drivers"]  # {"usd": ["DXY", "GOLD", "US10Y"], ...}
 
-SMA_PERIOD      = 20   # matches trend.sma_fast used elsewhere in features.py
-RSI_PERIOD      = 14   # matches rsi.period used elsewhere in features.py
-RETURN_4WK_LAG  = 4    # weekly candles — slower-moving companion to the 1-candle return
+SMA_PERIOD  = 20   # matches trend.sma_fast used elsewhere in features.py
+
+# Return lags and RSI period now match the EURUSD reference project's
+# add_macro_features exactly (return_1d, return_5d, rsi window=10),
+# carried over 1:1 in candle-count from daily to weekly bars per
+# project decision. Previously this engine used an ad-hoc 4-candle
+# return and a 14-period RSI that didn't correspond to anything in
+# the reference project — replaced now that we have the reference
+# file and know exactly what produced its 0.76 AUC result.
+RETURN_SHORT_LAG = MACRO_CFG["return_short_lag"]   # 1 weekly candle  (was "_1d")
+RETURN_LONG_LAG  = MACRO_CFG["return_long_lag"]    # 5 weekly candles (was "_5d")
+RSI_PERIOD       = MACRO_CFG["rsi_period"]         # 10 (reference project's macro RSI window)
 
 
 # =============================================================================
@@ -142,10 +155,17 @@ def compute_driver_features(driver_df: pd.DataFrame) -> pd.DataFrame:
                    name instead of a pair name).
 
     Returns:
-        DataFrame indexed by datetime with columns: return, return_4wk,
-        above_sma20, rsi. NOT yet prefixed with the driver symbol —
-        get_macro_features_for_basket() does that when assembling
-        multiple drivers together.
+        DataFrame indexed by datetime with columns: return_short,
+        return_long, above_sma20, rsi. NOT yet prefixed with the
+        driver symbol — get_macro_features_for_basket() does that
+        when assembling multiple drivers together.
+
+        Column naming matches the EURUSD reference project's
+        add_macro_features (return_1d/return_5d), renamed to
+        return_short/return_long since "1d"/"5d" would be misleading
+        on weekly bars — the LAG COUNTS are identical to the
+        reference (1 and 5 candles), just candles are weekly here
+        instead of daily.
     """
     if driver_df.empty or "close" not in driver_df.columns:
         logger.warning("compute_driver_features: empty or malformed driver_df")
@@ -155,11 +175,11 @@ def compute_driver_features(driver_df: pd.DataFrame) -> pd.DataFrame:
     close = df["close"]
 
     out = pd.DataFrame(index=df.index)
-    out["return"]      = close.pct_change(1)
-    out["return_4wk"]  = close.pct_change(RETURN_4WK_LAG)
-    sma20              = close.rolling(SMA_PERIOD).mean()
-    out["above_sma20"] = (close > sma20).astype(float)
-    out["rsi"]         = _compute_rsi(close, RSI_PERIOD)
+    out["return_short"]   = close.pct_change(RETURN_SHORT_LAG)
+    out["return_long"]    = close.pct_change(RETURN_LONG_LAG)
+    sma20                 = close.rolling(SMA_PERIOD).mean()
+    out["above_sma20"]    = (close > sma20).astype(float)
+    out["rsi"]            = _compute_rsi(close, RSI_PERIOD)
 
     return out
 
@@ -189,10 +209,10 @@ def get_macro_features_for_basket(
     Returns:
         DataFrame indexed by datetime with one column group per
         driver, prefixed by lowercased driver symbol, e.g. for the
-        "usd" basket: dxy_return, dxy_return_4wk, dxy_above_sma20,
-        dxy_rsi, gold_return, ..., us10y_rsi. Empty DataFrame if the
-        basket has no configured drivers or none of its drivers'
-        data is available yet.
+        "usd" basket: dxy_return_short, dxy_return_long,
+        dxy_above_sma20, dxy_rsi, gold_return_short, ..., us10y_rsi.
+        Empty DataFrame if the basket has no configured drivers or
+        none of its drivers' data is available yet.
     """
     driver_symbols = BASKET_DRIVERS.get(basket_name, [])
     if not driver_symbols:
