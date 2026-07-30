@@ -45,6 +45,19 @@ COMPLETE REDESIGN, NOT AN INCREMENTAL CHANGE:
    by predict_direction(), which predicts direction directly for every
    pair in a basket — there is no external candidate list to rank.
 
+5. PER-BASKET FEATURE COLUMNS, NOT ONE SHARED LIST. Since macro driver
+   features were added (see ml/features.py — usd gets 12 macro
+   columns from DXY/GOLD/US10Y, cad/chf/jpy/crosses each get 4 from
+   their single driver), a basket's feature-column set is no longer
+   identical across all 5 models. Both train_directional_model() and
+   predict_direction() now call
+   ml.features.get_directional_feature_cols(basket_name) to get THAT
+   basket's correct column list, instead of importing a single flat
+   DIRECTIONAL_FEATURE_COLS constant — using the flat constant here
+   would have silently trained/scored the usd model on only 4 of its
+   12 macro columns (whichever the base list happened to include),
+   with no error raised anywhere.
+
 Every threshold/period below is read live from config.yaml.
 """
 
@@ -64,7 +77,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.calibration import CalibratedClassifierCV
 
-from ml.features import DIRECTIONAL_FEATURE_COLS, compute_directional_features
+from ml.features import get_directional_feature_cols, compute_directional_features
 from utils.logging import get_ml_logger
 from utils.error_handler import MLError
 
@@ -202,9 +215,9 @@ def train_directional_model(
     Args:
         feature_matrix: Output of build_directional_feature_matrix()
                         for ONE basket's pairs. Must contain
-                        DIRECTIONAL_FEATURE_COLS + 'label' + 'pair' +
-                        'datetime'.
-        basket_name   : e.g. 'basket1_usd'
+                        get_directional_feature_cols(basket_name) +
+                        'label' + 'pair' + 'datetime'.
+        basket_name   : e.g. 'usd', 'cad', 'chf', 'jpy', 'crosses'
 
     Returns:
         Tuple of (trained Pipeline, metrics dict)
@@ -225,12 +238,14 @@ def train_directional_model(
         )
 
     df    = feature_matrix.copy()
-    X     = df[DIRECTIONAL_FEATURE_COLS].copy()
+    feature_cols = get_directional_feature_cols(basket_name)
+    X     = df[feature_cols].copy()
     y     = df["label"].values
     dates = pd.to_datetime(df["datetime"])
     pairs_in_matrix = df["pair"].unique().tolist()
 
     logger.info(f"{basket_name}: pairs in this matrix: {pairs_in_matrix}")
+    logger.info(f"{basket_name}: {len(feature_cols)} feature columns (incl. basket-specific macro drivers)")
 
     n_negative       = (y == 0).sum()
     n_positive       = (y == 1).sum()
@@ -416,6 +431,7 @@ def predict_direction(
     csi_df        : pd.DataFrame,
     signal_datetime,
     pipeline      : Optional[Pipeline] = None,
+    macro_features_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Predict direction for every pair in one basket, unconditionally.
@@ -429,6 +445,14 @@ def predict_direction(
                          signal_datetime
         signal_datetime: Timestamp of this scan run
         pipeline       : Optional pre-loaded model for this basket
+        macro_features_df: Output of
+                         engines.macro.get_macro_features_for_basket()
+                         for THIS basket — same object passed to every
+                         pair in the loop below (macro data isn't
+                         pair-specific, just basket-specific). Falls
+                         back to 0.0 for this basket's macro columns if
+                         not provided, matching
+                         compute_directional_features's own fallback.
 
     Returns:
         DataFrame [pair, up_probability], one row per pair that had
@@ -444,6 +468,8 @@ def predict_direction(
         )
         return pd.DataFrame(columns=["pair", "up_probability"])
 
+    feature_cols = get_directional_feature_cols(basket_name)
+
     results = []
     skipped = []
 
@@ -456,13 +482,14 @@ def predict_direction(
                 signal_datetime = signal_datetime,
                 prices_df       = px,
                 csi_df          = csi_df,
+                macro_features_df = macro_features_df,
             )
 
             if features is None:
                 skipped.append(pair)
                 continue
 
-            X = pd.DataFrame([features])[DIRECTIONAL_FEATURE_COLS]
+            X = pd.DataFrame([features])[feature_cols]
             up_probability = float(pipeline.predict_proba(X)[0][1])
 
         except Exception as e:
