@@ -6,7 +6,7 @@ on:
     # needs to run once a week. Matches config.yaml's
     # scheduler.run_times: ["00:00"]. Monday 00:00 UTC — right after
     # the weekend close, once the new weekly candle has formed.
-    - cron: '00 22 * * 1-5'
+    - cron: '00 00 * * 1-5'
   # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
 
