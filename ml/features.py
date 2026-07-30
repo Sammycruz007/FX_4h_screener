@@ -906,6 +906,28 @@ def compute_directional_features(
         expected_macro_cols = MACRO_FEATURE_COLS_BY_BASKET.get(basket_name, [])
 
         if macro_features_df is not None and not macro_features_df.empty:
+            # Normalise the index to tz-naive HERE, the same way
+            # signal_datetime is normalised above (lines ~788-790),
+            # rather than assuming the caller already did it.
+            # build_directional_feature_matrix (training path) DOES
+            # normalise macro_features_by_basket before calling this
+            # function, but predict_direction (live-scan path) passes
+            # engines.macro.get_macro_features_for_basket()'s output
+            # straight through — and that index is built directly
+            # from the driver's raw 'datetime' column, which is
+            # tz-aware (datetime64[ns, UTC]) coming out of Supabase.
+            # Comparing a tz-aware index against the tz-naive
+            # signal_datetime above raised "Invalid comparison between
+            # dtype=datetime64[ns, UTC] and Timestamp" on every single
+            # prediction in production. Normalising unconditionally
+            # here — instead of only in the training path — makes this
+            # function correct regardless of which caller's tz-handling
+            # habits it's fed.
+            macro_index = macro_features_df.index
+            if isinstance(macro_index, pd.DatetimeIndex) and macro_index.tz is not None:
+                macro_index = macro_index.tz_localize(None)
+                macro_features_df = macro_features_df.set_axis(macro_index)
+
             macro_asof = macro_features_df[macro_features_df.index <= signal_datetime]
             if not macro_asof.empty:
                 latest_macro_row = macro_asof.iloc[-1]
