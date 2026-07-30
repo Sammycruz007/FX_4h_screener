@@ -32,7 +32,7 @@ logging:
   max_file_size_mb: 10
 
 ml:
-  high_probability_threshold: 0.65
+  high_probability_threshold: 0.55
   # Locked: 2 weekly candles ahead (~2 weeks forward).
   label_forward_periods: 2
   min_training_samples: 50
@@ -189,13 +189,56 @@ trend:
   # price_vs_sma50, sma_cross), matching the EURUSD reference project.
   sma_fast: 20
   sma_slow: 50
+  # Extra SMA/EMA from the reference project's add_trend_features —
+  # sma_10 feeds sma_cross (sma_10 > sma_20), ema_10 is its own
+  # feature. Same window lengths as the reference (10), carried over
+  # 1:1 in candle-count (weekly candles instead of daily), per project
+  # decision: same settings, weeks instead of days.
+  sma_short: 10
+  ema_short: 10
+
+stochastic:
+  # Stochastic Oscillator (%K, %D) — 2nd-most-important single feature
+  # in the EURUSD reference project's importance ranking (stoch_k),
+  # entirely missing from this project until now. Same window (14) as
+  # the reference, carried over 1:1 in candle-count.
+  period: 14
+
+lag_features:
+  # Simple N-candle-ago returns (distinct from price_roc, which uses a
+  # single 10-candle lookback) — return_lag_5 ranked in the reference
+  # project's top 15. Same lag set as the reference (2, 3, 5, 10),
+  # carried over 1:1 in candle-count (weekly candles instead of daily).
+  lags: [2, 3, 5, 10]
+  # Rolling return-volatility windows feeding vol_expanding (replaces
+  # the atr_fast/atr_slow-based version with the reference project's
+  # own return-stdev-based definition, kept alongside atr_ratio rather
+  # than instead of it, since atr_ratio already existed here and both
+  # measure the same underlying "is volatility expanding" concept from
+  # slightly different angles).
+  volatility_short: 10
+  volatility_long: 20
 
 macro:
   # External, non-price-derived drivers — the EURUSD-only project's
-  # biggest edge came from these (DXY/10Y yield/gold), which the
-  # original basket design had none of. Mapped per basket to each
-  # quote currency's real fundamental driver, not just reused
-  # generically across all baskets.
+  # biggest edge came from these (DXY/10Y yield/gold): in its feature-
+  # importance ranking, dxy_return_1d/dxy_rsi/dxy_return_5d/
+  # gold_return_1d occupied 4 of the top 5 spots, well above every
+  # single technical indicator. Mapped per basket to each quote
+  # currency's real fundamental driver, not just reused generically
+  # across all baskets.
+  #
+  # WINDOW LENGTHS: same candle-count as the reference project (1 and
+  # 5), carried over from daily to weekly bars per project decision —
+  # "same settings, weeks instead of days" — so return_1d -> return_1wk
+  # (1 weekly candle) and return_5d -> return_5wk (5 weekly candles).
+  # rsi_period also matches the reference project's macro RSI (10),
+  # which differs from this project's own price-feature RSI (14,
+  # Wilder's standard) — the reference project used a shorter,
+  # more-reactive window specifically for its macro indicators.
+  return_short_lag: 1
+  return_long_lag: 5
+  rsi_period: 10
   #
   # yfinance tickers:
   #   DXY    -> "DX-Y.NYB"  (US Dollar Index)
