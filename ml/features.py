@@ -122,6 +122,8 @@ MOMENTUM_CFG  = config["momentum"]
 RSI_CFG       = config["rsi"]
 MACD_CFG      = config["macd"]
 TREND_CFG     = config["trend"]
+STOCH_CFG     = config["stochastic"]
+LAG_CFG       = config["lag_features"]
 UNIVERSE_CFG  = config["universe"]
 
 ATR_FAST_PERIOD = ATR_CFG["fast_period"]
@@ -159,6 +161,25 @@ MACD_SIGNAL_PERIOD = MACD_CFG["signal_period"]
 # price_vs_sma20 / price_vs_sma50 / sma_cross features.
 SMA_FAST_PERIOD = TREND_CFG["sma_fast"]
 SMA_SLOW_PERIOD = TREND_CFG["sma_slow"]
+# sma_10/ema_10 — the reference project's add_trend_features also
+# computes these (sma_10 feeds its own sma_cross = sma_10 > sma_20;
+# ema_10 is its own feature). Same window length as the reference,
+# carried over 1:1 in candle-count (weekly instead of daily).
+SMA_SHORT_PERIOD = TREND_CFG["sma_short"]
+EMA_SHORT_PERIOD = TREND_CFG["ema_short"]
+
+# Stochastic Oscillator — stoch_k was the reference project's 2nd
+# most important single feature; entirely missing from this project
+# until now. Same window as the reference, carried over 1:1 in
+# candle-count.
+STOCH_PERIOD = STOCH_CFG["period"]
+
+# Simple N-candle-ago returns + rolling return-volatility windows —
+# from the reference project's add_lag_features. Same lag set / window
+# lengths as the reference, carried over 1:1 in candle-count.
+RETURN_LAGS       = LAG_CFG["lags"]
+VOLATILITY_SHORT  = LAG_CFG["volatility_short"]
+VOLATILITY_LONG   = LAG_CFG["volatility_long"]
 
 # pair -> basket name lookup, built once from config.yaml's
 # universe.baskets, so compute_directional_features can find which
@@ -171,8 +192,8 @@ _PAIR_TO_BASKET = {
 }
 
 # basket -> expected macro feature column names, e.g.
-# "usd" -> ["dxy_return", "dxy_return_4wk", "dxy_above_sma20",
-#           "dxy_rsi", "gold_return", ..., "us10y_rsi"].
+# "usd" -> ["dxy_return_short", "dxy_return_long", "dxy_above_sma20",
+#           "dxy_rsi", "gold_return_short", ..., "us10y_rsi"].
 # Built once from config.yaml's macro.basket_drivers + macro.drivers,
 # matching the column-naming convention engines/macro.py's
 # get_macro_features_for_basket() produces (add_prefix with the
@@ -182,7 +203,7 @@ _PAIR_TO_BASKET = {
 MACRO_CFG          = config["macro"]
 _MACRO_DRIVERS     = MACRO_CFG["drivers"]
 _MACRO_BASKET_MAP  = MACRO_CFG["basket_drivers"]
-_MACRO_FEATURE_SUFFIXES = ["return", "return_4wk", "above_sma20", "rsi"]
+_MACRO_FEATURE_SUFFIXES = ["return_short", "return_long", "above_sma20", "rsi"]
 
 MACRO_FEATURE_COLS_BY_BASKET = {
     basket_name: [
@@ -192,6 +213,22 @@ MACRO_FEATURE_COLS_BY_BASKET = {
         for suffix in _MACRO_FEATURE_SUFFIXES
     ]
     for basket_name, driver_symbols in _MACRO_BASKET_MAP.items()
+}
+
+# basket -> one-hot pair-identity column names, e.g.
+# "usd" -> ["pair_is_eurusd", "pair_is_gbpusd", "pair_is_audusd",
+#           "pair_is_nzdusd"]. Per project decision: within a basket,
+# pairs sharing the same quote currency (e.g. EURUSD/AUDUSD both in
+# "usd") still behave differently under the same macro regime — the
+# model previously had no way to distinguish which pair a row
+# belonged to. One-hot (not ordinal) since pairs have no natural
+# ordering and a basket's pair set is small and fixed, so the extra
+# columns are cheap. Built once per basket from config.yaml's
+# universe.baskets, in the SAME order every time (sorted), so column
+# position is stable across training and inference for a given basket.
+PAIR_IDENTITY_COLS_BY_BASKET = {
+    basket_name: [f"pair_is_{pair.lower()}" for pair in sorted(pairs)]
+    for basket_name, pairs in UNIVERSE_CFG["baskets"].items()
 }
 
 
@@ -408,48 +445,170 @@ def _compute_macd(px: pd.DataFrame) -> dict:
 
 def _compute_sma_trend(px: pd.DataFrame) -> dict:
     """
-    Price-vs-trend position: how far current close sits above/below
-    its own SMA_FAST/SMA_SLOW, expressed as a fraction of price (not
-    raw price units — FX pairs quote at very different decimal scales,
-    e.g. JPY pairs in 2 decimals vs. others in 4-5, so a raw price
-    difference isn't comparable across pairs the way a % difference is).
+    Price-vs-trend position + trend/regime flags, matching the
+    EURUSD reference project's add_trend_features + add_regime_features
+    exactly (window lengths carried over 1:1 in candle-count, weekly
+    instead of daily):
 
-    Returns:
-        Dict with price_vs_sma20, price_vs_sma50 (both fractional,
-        e.g. 0.01 = 1% above the SMA), and sma_cross (1 if the fast
-        SMA is above the slow SMA, else 0 — a simple trend-direction
-        flag). Falls back to 0.0 / 0.0 / 0 if insufficient history for
-        either SMA.
+    - sma_10, ema_10  : the short-window trend features themselves
+                        (not just used for a ratio — the reference
+                        project keeps these as standalone features)
+    - price_vs_sma20/50: how far current close sits above/below its
+                        own SMA_FAST/SMA_SLOW, expressed as a fraction
+                        of price (not raw price units — FX pairs quote
+                        at very different decimal scales, e.g. JPY
+                        pairs in 2 decimals vs. others in 4-5, so a raw
+                        price difference isn't comparable across pairs
+                        the way a % difference is)
+    - above_sma20/50  : 1/0 flags — is price currently above its own
+                        SMA_FAST/SMA_SLOW (reference project's
+                        add_regime_features)
+    - sma_cross       : 1 if SMA_SHORT (10) > SMA_FAST (20), else 0 —
+                        NOTE this matches the reference project's own
+                        definition (sma_10 > sma_20) exactly. This is
+                        NOT "fast SMA > slow SMA" in the 20/50 sense —
+                        it's specifically the short/fast pairing the
+                        reference project used, corrected from an
+                        earlier version of this file that had used
+                        20-vs-50 instead.
+
+    Falls back to 0.0 / 0 for any feature whose required SMA/EMA
+    window exceeds available history.
     """
     close = px["close"]
     current_close = close.iloc[-1]
 
-    if len(close) < SMA_FAST_PERIOD:
-        price_vs_sma20 = 0.0
-    else:
-        sma20 = close.tail(SMA_FAST_PERIOD).mean()
-        price_vs_sma20 = float((current_close - sma20) / sma20) if sma20 > 0 else 0.0
+    def _sma(period):
+        if len(close) < period:
+            return None
+        return float(close.tail(period).mean())
 
-    if len(close) < SMA_SLOW_PERIOD:
-        price_vs_sma50 = 0.0
-        sma_cross      = 0
+    sma10 = _sma(SMA_SHORT_PERIOD)
+    sma20 = _sma(SMA_FAST_PERIOD)
+    sma50 = _sma(SMA_SLOW_PERIOD)
+
+    if len(close) < EMA_SHORT_PERIOD:
+        ema10 = None
     else:
-        sma20_for_cross = close.tail(SMA_FAST_PERIOD).mean()
-        sma50           = close.tail(SMA_SLOW_PERIOD).mean()
-        price_vs_sma50  = float((current_close - sma50) / sma50) if sma50 > 0 else 0.0
-        sma_cross       = int(sma20_for_cross > sma50)
+        ema10 = float(close.ewm(span=EMA_SHORT_PERIOD, adjust=False).mean().iloc[-1])
+
+    price_vs_sma20 = float((current_close - sma20) / sma20) if sma20 and sma20 > 0 else 0.0
+    price_vs_sma50 = float((current_close - sma50) / sma50) if sma50 and sma50 > 0 else 0.0
+    above_sma20    = int(current_close > sma20) if sma20 is not None else 0
+    above_sma50    = int(current_close > sma50) if sma50 is not None else 0
+    sma_cross      = int(sma10 > sma20) if (sma10 is not None and sma20 is not None) else 0
 
     return {
-        "price_vs_sma20": price_vs_sma20,
-        "price_vs_sma50": price_vs_sma50,
+        "sma_10"         : sma10 if sma10 is not None else 0.0,
+        "ema_10"         : ema10 if ema10 is not None else 0.0,
+        "price_vs_sma20" : price_vs_sma20,
+        "price_vs_sma50" : price_vs_sma50,
+        "above_sma20"    : above_sma20,
+        "above_sma50"    : above_sma50,
         "sma_cross"      : sma_cross,
     }
 
 
-def _compute_regime_flags(px: pd.DataFrame, rsi_value: float, atr_fast: float, atr_slow: float) -> dict:
+def _compute_stochastic(px: pd.DataFrame, period: int = STOCH_PERIOD) -> dict:
+    """
+    Stochastic Oscillator (%K, %D) — the EURUSD reference project's
+    2nd most important single feature (stoch_k), entirely missing from
+    this project until now. Standard definition:
+        %K = 100 * (close - lowest_low) / (highest_high - lowest_low)
+        %D = 3-period SMA of %K
+    Same window (STOCH_PERIOD) as the reference project, carried over
+    1:1 in candle-count.
+
+    Returns:
+        Dict with stoch_k, stoch_d. Falls back to 50.0/50.0 (neutral,
+        mid-range) if fewer than period+3 candles are available (the
+        +3 covers %D's own 3-period smoothing of %K).
+    """
+    if len(px) < period + 3:
+        return {"stoch_k": 50.0, "stoch_d": 50.0}
+
+    high = px["high"]
+    low  = px["low"]
+    close = px["close"]
+
+    lowest_low   = low.rolling(period).min()
+    highest_high = high.rolling(period).max()
+    denom        = (highest_high - lowest_low).replace(0, np.nan)
+
+    pct_k = 100 * (close - lowest_low) / denom
+    pct_d = pct_k.rolling(3).mean()
+
+    k_val = pct_k.iloc[-1]
+    d_val = pct_d.iloc[-1]
+
+    return {
+        "stoch_k": float(k_val) if pd.notna(k_val) else 50.0,
+        "stoch_d": float(d_val) if pd.notna(d_val) else 50.0,
+    }
+
+
+def _compute_lag_features(px: pd.DataFrame) -> dict:
+    """
+    Simple N-candle-ago returns + rolling return-volatility windows,
+    matching the EURUSD reference project's add_lag_features exactly
+    (return_lag_5 ranked in its top 15; distinct from price_roc, which
+    uses a single fixed lookback). Same lag set / window lengths as
+    the reference, carried over 1:1 in candle-count.
+
+    Returns:
+        Dict with return_lag_{N} for each N in RETURN_LAGS, hl_range
+        (High-Low)/Close for the latest candle, and volatility_short/
+        volatility_long (rolling stdev of returns). Each individual
+        lag/window falls back to 0.0 if insufficient history for that
+        specific window — shorter lags/windows still populate even if
+        a longer one doesn't have enough history yet.
+    """
+    close = px["close"]
+    current_close = close.iloc[-1]
+
+    result = {}
+    for lag in RETURN_LAGS:
+        if len(close) < lag + 1:
+            result[f"return_lag_{lag}"] = 0.0
+        else:
+            past_close = close.iloc[-1 - lag]
+            result[f"return_lag_{lag}"] = float((current_close - past_close) / past_close) if past_close != 0 else 0.0
+
+    latest_high  = px["high"].iloc[-1]
+    latest_low   = px["low"].iloc[-1]
+    result["hl_range"] = float((latest_high - latest_low) / current_close) if current_close != 0 else 0.0
+
+    returns = close.pct_change()
+
+    if len(returns.dropna()) < VOLATILITY_SHORT:
+        result["volatility_short"] = 0.0
+    else:
+        result["volatility_short"] = float(returns.tail(VOLATILITY_SHORT).std())
+
+    if len(returns.dropna()) < VOLATILITY_LONG:
+        result["volatility_long"] = 0.0
+    else:
+        result["volatility_long"] = float(returns.tail(VOLATILITY_LONG).std())
+
+    return result
+
+
+def _compute_regime_flags(px: pd.DataFrame, rsi_value: float, volatility_short: float, volatility_long: float) -> dict:
     """
     Regime/streak features from the reference project: how extended is
     the current move, not just its raw indicator value.
+
+    STREAK DEFINITION — matches the reference project's
+    add_regime_features exactly: up_streak/down_streak are the
+    consecutive-run LENGTH multiplied by whether the LATEST candle's
+    return was itself positive/negative (the reference project's
+    groupby/cumcount-then-gate-by-latest-sign construction). In
+    practice, for the single latest row this reduces to: count
+    consecutive up (or down) closes ending at the latest candle, same
+    as counting the run length directly — this implementation counts
+    the run directly rather than reproducing the groupby machinery,
+    since both produce the identical value for "the latest row's
+    streak length," which is all a single-timestamp feature needs.
 
     Returns:
         Dict with:
@@ -457,8 +616,13 @@ def _compute_regime_flags(px: pd.DataFrame, rsi_value: float, atr_fast: float, a
           at the latest candle (one of these is always 0)
         - rsi_oversold / rsi_overbought: 1/0 flags at the conventional
           30/70 RSI thresholds
-        - vol_expanding: 1 if atr_fast > atr_slow (volatility currently
-          expanding vs. its own slower baseline), else 0
+        - vol_expanding: 1 if volatility_short > volatility_long
+          (rolling return-stdev currently expanding vs. its own slower
+          baseline), else 0 — matches the reference project's own
+          definition (compares its volatility_10/volatility_20
+          return-stdev features), NOT atr_fast/atr_slow (which is a
+          separate, already-existing feature in this project measuring
+          the same underlying concept a different way).
     """
     closes = px["close"].values
     up_streak   = 0
@@ -481,7 +645,7 @@ def _compute_regime_flags(px: pd.DataFrame, rsi_value: float, atr_fast: float, a
         "down_streak"    : down_streak,
         "rsi_oversold"   : int(rsi_value <= 30),
         "rsi_overbought" : int(rsi_value >= 70),
-        "vol_expanding"  : int(atr_fast > atr_slow) if atr_slow > 0 else 0,
+        "vol_expanding"  : int(volatility_short > volatility_long) if volatility_long > 0 else 0,
     }
 
 
@@ -708,16 +872,32 @@ def compute_directional_features(
     # ── GROUP 9: MACD ────────────────────────────────────────────────────────
     macd_result = _compute_macd(px)
 
-    # ── GROUP 10: SMA trend position ────────────────────────────────────────
+    # ── GROUP 10: SMA trend position (+ sma_10/ema_10/above_sma20/50) ───────
     sma_trend = _compute_sma_trend(px)
 
+    # ── GROUP 13: Stochastic Oscillator ─────────────────────────────────────
+    # NEW — reference project's 2nd most important single feature,
+    # missing from this project until now.
+    stochastic = _compute_stochastic(px)
+
+    # ── GROUP 14: Lag returns + hl_range + rolling return-volatility ────────
+    # NEW — return_lag_5 ranked in the reference project's top 15;
+    # volatility_short/long feed GROUP 11's vol_expanding below.
+    lag_features = _compute_lag_features(px)
+
     # ── GROUP 11: Regime/streak flags ───────────────────────────────────────
-    regime_flags = _compute_regime_flags(px, rsi_value, atr_fast, atr_slow)
+    # vol_expanding now compares lag_features' own volatility_short/long
+    # (matching the reference project's definition) rather than
+    # atr_fast/atr_slow (which remains its own separate feature, Group 1).
+    regime_flags = _compute_regime_flags(
+        px, rsi_value,
+        lag_features["volatility_short"], lag_features["volatility_long"],
+    )
 
     # ── GROUP 12: Macro drivers (per this pair's basket) ────────────────────
     # Falls back to 0.0 for every driver column this pair's basket is
     # configured for (see config.yaml's macro.basket_drivers), rather
-    # than silently omitting the columns — keeps DIRECTIONAL_FEATURE_COLS
+    # than silently omitting the columns — keeps get_directional_feature_cols
     # consistent across every row regardless of macro data availability.
     basket_name    = _PAIR_TO_BASKET.get(pair)
     macro_features = {}
@@ -737,6 +917,18 @@ def compute_directional_features(
         # (no macro_features_df provided, or no row as-of this date yet).
         for col in expected_macro_cols:
             macro_features.setdefault(col, 0.0)
+
+    # ── GROUP 15: Pair identity (one-hot, per basket) ───────────────────────
+    # NEW, per project decision: within a basket, pairs sharing the same
+    # quote currency still behave differently under the same macro
+    # regime — this lets the model tell them apart. Exactly one column
+    # is 1 (this row's own pair), all others in the basket's set are 0.
+    pair_identity_features = {}
+    if basket_name is not None:
+        expected_pair_cols = PAIR_IDENTITY_COLS_BY_BASKET.get(basket_name, [])
+        this_pair_col = f"pair_is_{pair.lower()}"
+        for col in expected_pair_cols:
+            pair_identity_features[col] = 1 if col == this_pair_col else 0
 
     # ── Assemble all features ─────────────────────────────────────────────────
     features = {
@@ -783,8 +975,12 @@ def compute_directional_features(
         "macd_hist"          : round(macd_result["macd_hist"],   6),
 
         # Group 10: SMA trend position
+        "sma_10"             : round(sma_trend["sma_10"], 6),
+        "ema_10"             : round(sma_trend["ema_10"], 6),
         "price_vs_sma20"     : round(sma_trend["price_vs_sma20"], 6),
         "price_vs_sma50"     : round(sma_trend["price_vs_sma50"], 6),
+        "above_sma20"        : sma_trend["above_sma20"],
+        "above_sma50"        : sma_trend["above_sma50"],
         "sma_cross"          : sma_trend["sma_cross"],
 
         # Group 11: Regime/streak flags
@@ -796,6 +992,22 @@ def compute_directional_features(
 
         # Group 12: Macro drivers (per basket — column set varies)
         **{col: round(val, 6) for col, val in macro_features.items()},
+
+        # Group 13: Stochastic Oscillator
+        "stoch_k"            : round(stochastic["stoch_k"], 4),
+        "stoch_d"            : round(stochastic["stoch_d"], 4),
+
+        # Group 14: Lag returns + hl_range + rolling return-volatility
+        **{
+            f"return_lag_{lag}": round(lag_features[f"return_lag_{lag}"], 6)
+            for lag in RETURN_LAGS
+        },
+        "hl_range"           : round(lag_features["hl_range"], 6),
+        "volatility_short"   : round(lag_features["volatility_short"], 6),
+        "volatility_long"    : round(lag_features["volatility_long"],  6),
+
+        # Group 15: Pair identity (one-hot, per basket — column set varies)
+        **pair_identity_features,
     }
 
     return features
@@ -951,18 +1163,16 @@ def build_directional_feature_matrix(
 # =============================================================================
 # FEATURE COLUMNS — used at both train and inference time
 # =============================================================================
-
-# =============================================================================
-# FEATURE COLUMNS — used at both train and inference time
-# =============================================================================
-# NOTE ON MACRO COLUMNS: unlike every other feature group, macro
-# columns are NOT the same across all 5 basket models — the usd
-# basket gets 12 macro columns (DXY+GOLD+US10Y × 4 features each),
-# while cad/chf/jpy/crosses each get 4 (their single driver × 4
-# features). A single flat DIRECTIONAL_FEATURE_COLS list would either
-# be wrong for the usd model (missing 8 columns) or wrong for every
-# other model (8 columns of zeros that don't correspond to anything
-# real for that basket). get_directional_feature_cols(basket_name)
+# NOTE ON MACRO COLUMNS AND PAIR-IDENTITY COLUMNS: unlike every other
+# feature group, these two are NOT the same across all 5 basket
+# models:
+#   - macro: usd gets 12 columns (DXY+GOLD+US10Y x 4 features each),
+#     cad/chf/jpy/crosses each get 4 (their single driver x 4 features)
+#   - pair identity: usd/crosses get 4-6 one-hot columns, cad gets 5,
+#     chf/jpy get 6-7 — one column per pair IN THAT BASKET (see
+#     PAIR_IDENTITY_COLS_BY_BASKET)
+# A single flat DIRECTIONAL_FEATURE_COLS list would be wrong for every
+# basket in a different way. get_directional_feature_cols(basket_name)
 # below is the correct way to get a basket's column set — train_models.py
 # and any inference code should call it per-basket rather than using
 # a single shared constant.
@@ -1002,14 +1212,29 @@ _BASE_DIRECTIONAL_FEATURE_COLS = [
     "macd",
     "macd_signal",
     "macd_hist",
-    # SMA trend position (restored from the reference project)
+    # SMA trend position (restored from the reference project, with
+    # sma_10/ema_10/above_sma20/above_sma50 added to match it exactly)
+    "sma_10",
+    "ema_10",
     "price_vs_sma20",
     "price_vs_sma50",
+    "above_sma20",
+    "above_sma50",
     "sma_cross",
     # Regime/streak flags (restored from the reference project)
     "up_streak",
     "down_streak",
     "vol_expanding",
+    # Stochastic Oscillator (NEW — reference project's 2nd most
+    # important single feature, was missing from this project)
+    "stoch_k",
+    "stoch_d",
+    # Lag returns + hl_range + rolling return-volatility (NEW —
+    # return_lag_5 ranked in the reference project's top 15)
+    *[f"return_lag_{lag}" for lag in RETURN_LAGS],
+    "hl_range",
+    "volatility_short",
+    "volatility_long",
 ]
 
 
@@ -1017,8 +1242,9 @@ def get_directional_feature_cols(basket_name: str) -> list[str]:
     """
     Return the full ordered feature-column list for a given basket's
     model — the shared base columns (identical across every basket)
-    plus that basket's specific macro driver columns (which differ per
-    basket — see the module-level note above).
+    plus that basket's specific macro driver columns AND pair-identity
+    one-hot columns (both differ per basket — see the module-level
+    note above).
 
     Args:
         basket_name: e.g. "usd", "cad", "chf", "jpy", "crosses"
@@ -1029,12 +1255,13 @@ def get_directional_feature_cols(basket_name: str) -> list[str]:
         scoring this basket's model.
     """
     macro_cols = MACRO_FEATURE_COLS_BY_BASKET.get(basket_name, [])
-    return _BASE_DIRECTIONAL_FEATURE_COLS + macro_cols
+    pair_cols  = PAIR_IDENTITY_COLS_BY_BASKET.get(basket_name, [])
+    return _BASE_DIRECTIONAL_FEATURE_COLS + macro_cols + pair_cols
 
 
 # Kept for any existing caller that imports this name directly — this
 # is ONLY the shared base set and does NOT include any basket's macro
-# columns. New code (train_models.py, inference) should call
-# get_directional_feature_cols(basket_name) instead, which returns the
-# correct full set for a specific basket.
+# or pair-identity columns. New code (train_models.py, inference)
+# should call get_directional_feature_cols(basket_name) instead, which
+# returns the correct full set for a specific basket.
 DIRECTIONAL_FEATURE_COLS = _BASE_DIRECTIONAL_FEATURE_COLS
