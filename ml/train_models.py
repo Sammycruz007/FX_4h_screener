@@ -49,6 +49,19 @@ THIS IS A COMPLETE REDESIGN, NOT AN INCREMENTAL CHANGE:
 5. Column naming: 'pair'/'datetime' throughout — unchanged from every
    other file in this project.
 
+6. MACRO DRIVER FEATURES ADDED (per project decision, after comparing
+   against the EURUSD reference project's feature set). Macro history
+   (DXY, gold, US10Y, WTI, VIX) is fetched and stored through the
+   IDENTICAL path as FX pairs (see data/fetcher.py's smart_fetch_macro),
+   so in cloud mode it's already present in read_price_history()'s
+   result — this file just pulls it out by symbol name rather than
+   re-fetching it. engines/macro.py's get_macro_features_for_basket()
+   is called ONCE PER BASKET (basket-scoped, unlike CSI which is
+   universe-scoped) and threaded into build_directional_feature_matrix.
+   Each basket's model now also uses ml.features.get_directional_feature_cols
+   (basket_name), NOT the old flat DIRECTIONAL_FEATURE_COLS constant,
+   since macro columns differ per basket (12 for usd, 4 for the rest).
+
 Every threshold/period/list below is read live from config.yaml —
 nothing in this file hardcodes a value that config already owns.
 """
@@ -81,6 +94,7 @@ else:
 
 from engines.adx import compute_adx_latest
 from engines.csi import compute_csi_series
+from engines.macro import get_macro_features_for_basket
 from ml.labeller  import label_direction
 from ml.features  import build_directional_feature_matrix
 from ml.signal_ranker import train_directional_model
@@ -102,6 +116,7 @@ config       = _load_config()
 ML_CFG       = config["ml"]
 UNIVERSE_CFG = config["universe"]
 ADX_CFG      = config["adx"]
+MACRO_CFG    = config["macro"]
 
 HORIZON = ML_CFG["label_forward_periods"]   # 2 weekly candles, see labeller.py
 STRIDE  = ML_CFG["backfill_stride"]
@@ -121,6 +136,19 @@ MIN_ROWS_FOR_BACKFILL = ADX_PERIOD * 3
 # project's basket-model decision.
 PAIRS   = UNIVERSE_CFG["pairs"]
 BASKETS = UNIVERSE_CFG["baskets"]   # dict: basket_name -> list of pairs
+
+# Macro driver config — same source engines/macro.py reads, used here
+# to know which storage symbols (DXY, GOLD, US10Y, WTI, VIX) to pull
+# out of the price history that's already been read for FX pairs
+# (macro symbols are fetched and stored through the identical
+# write_raw_prices path as FX pairs — see data/fetcher.py's
+# smart_fetch_macro — so they're already present in read_price_history()'s
+# result, just under a macro 'pair' name instead of an FX pair name).
+MACRO_DRIVERS      = MACRO_CFG["drivers"]          # {"DXY": {...}, ...}
+MACRO_BASKET_MAP    = MACRO_CFG["basket_drivers"]   # {"usd": ["DXY", ...], ...}
+MACRO_STORAGE_SYMBOLS = sorted({
+    driver_cfg["storage_symbol"] for driver_cfg in MACRO_DRIVERS.values()
+})
 
 # Cap for quick test runs — set to None for full universe
 MAX_PAIRS_FOR_TRAINING = None
@@ -215,6 +243,31 @@ def run_training():
             for name, group in full_history.groupby("pair")
         }
 
+    # ── Macro driver history — same storage path as FX pairs (see
+    # data/fetcher.py's smart_fetch_macro), just keyed by a macro
+    # symbol name (DXY, GOLD, US10Y, WTI, VIX) instead of an FX pair.
+    # In cloud mode this data is ALREADY present in grouped_history
+    # (read_price_history() reads everything in storage, macro symbols
+    # included) — no separate fetch needed here, just pulled out by name.
+    logger.info(f"Loading macro driver history: {MACRO_STORAGE_SYMBOLS}")
+    macro_data = {}
+    for storage_symbol in MACRO_STORAGE_SYMBOLS:
+        if _CLOUD_MODE:
+            macro_df = grouped_history.get(storage_symbol, pd.DataFrame())
+        else:
+            macro_df = read_raw_prices(storage_symbol)
+
+        if macro_df.empty:
+            logger.warning(
+                f"No history found for macro driver '{storage_symbol}' — "
+                f"any basket using it will get 0.0 for its features from "
+                f"this driver (see engines/macro.py's fallback behaviour)"
+            )
+        macro_data[storage_symbol] = macro_df
+
+    macro_rows_total = sum(len(df) for df in macro_data.values())
+    logger.info(f"Macro driver history loaded | {macro_rows_total} total rows across {len(MACRO_STORAGE_SYMBOLS)} symbols")
+
     logger.info("Preparing pair datasets for parallel processing...")
     pair_tasks = []
     for pair in pairs:
@@ -295,6 +348,31 @@ def run_training():
     else:
         logger.info(f"CSI backfill complete | {len(csi_series_df)} (pair, datetime) rows")
 
+    # ── Macro features — computed ONCE PER BASKET (not per-pair, not
+    # cross-basket like CSI) — each basket only needs its OWN
+    # configured driver(s)' history (see config.yaml's
+    # macro.basket_drivers), so this is naturally basket-scoped rather
+    # than universe-scoped the way CSI is.
+    logger.info("Computing macro driver features per basket...")
+
+    macro_features_by_basket = {}
+    for basket_name in BASKETS:
+        basket_macro_df = get_macro_features_for_basket(basket_name, macro_data)
+        macro_features_by_basket[basket_name] = basket_macro_df
+
+        if basket_macro_df.empty:
+            logger.warning(
+                f"{basket_name}: no macro features available — all macro "
+                f"driver columns will be 0.0 for this basket's training "
+                f"examples"
+            )
+        else:
+            logger.info(
+                f"{basket_name}: macro features ready | "
+                f"{len(basket_macro_df)} rows | "
+                f"columns: {list(basket_macro_df.columns)}"
+            )
+
     # ── Directional labels — UNCONDITIONAL, every row, every pair. No
     # scanner gate, no candidate concept.
     logger.info("Generating directional labels for the full universe...")
@@ -342,6 +420,7 @@ def run_training():
             prices_df      = basket_prices,
             labels_df      = basket_labels,
             csi_series_df  = csi_series_df,
+            macro_features_by_basket = {basket_name: macro_features_by_basket.get(basket_name, pd.DataFrame())},
         )
 
         if basket_matrix.empty:
