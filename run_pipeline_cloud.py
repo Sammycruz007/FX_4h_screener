@@ -43,6 +43,27 @@ THIS IS A COMPLETE REDESIGN, NOT AN INCREMENTAL CHANGE:
    all and (b) cleared the display threshold. Rows that didn't clear
    the threshold are NOT written.
 
+6. MACRO DRIVERS WIRED IN (per project decision, after comparing
+   against the EURUSD reference project's feature set):
+   - STEP 3.2 fetches macro driver data (DXY, gold, US10Y, WTI, VIX)
+     via data.fetcher.smart_fetch_macro(), right after the FX fetch.
+     Kept non-fatal — a macro-source hiccup never blocks the FX
+     pipeline (matches data/fetcher.py's own run_data_pipeline).
+   - STEP 3.4's snapshot write now includes macro rows alongside FX
+     rows (same storage schema), so macro history actually persists
+     to Storage for future runs (including ml/train_models.py's
+     backfill) to read back — without this, smart_fetch_macro()
+     fetching successfully wouldn't be enough; the data has to be
+     written too.
+   - STEP 7.5 computes each basket's macro features via
+     engines.macro.get_macro_features_for_basket(), reusing STEP 6's
+     tickers_data dict directly (it already contains the macro
+     symbols alongside the 28 FX pairs, since working_df was read
+     back from the same Storage snapshot).
+   - STEP 9 passes each basket's macro_features_df into
+     predict_direction(), which threads it into
+     compute_directional_features() the same way training does.
+
 COLUMN NAMING (pair/datetime, not ticker/date):
    Consistent with every other file in this project.
 """
@@ -57,7 +78,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import yaml
 
-from data.fetcher import get_full_universe, smart_fetch, to_pair_dict
+from data.fetcher import get_full_universe, smart_fetch, smart_fetch_macro, to_pair_dict
 from data.database_cloud import (
     initialise_database,
     write_indicator_results,
@@ -68,6 +89,7 @@ from data.storage_cloud import write_snapshot, consolidate_snapshots, read_price
 from engines.adx import compute_adx_latest
 from engines.csi import run_csi_engine
 from engines.candlestick import compute_raw_pattern_flags
+from engines.macro import get_macro_features_for_basket
 
 from ml.signal_ranker import predict_direction, load_directional_model
 
@@ -89,10 +111,16 @@ config       = _load_config()
 STORAGE_CFG  = config["storage"]
 ML_CFG       = config["ml"]
 UNIVERSE_CFG = config["universe"]
+MACRO_CFG    = config["macro"]
 
 RETENTION_DAYS     = STORAGE_CFG["retention_days"]
 DISPLAY_THRESHOLD  = ML_CFG["high_probability_threshold"]
 BASKETS            = UNIVERSE_CFG["baskets"]
+
+MACRO_DRIVERS         = MACRO_CFG["drivers"]
+MACRO_STORAGE_SYMBOLS = sorted({
+    driver_cfg["storage_symbol"] for driver_cfg in MACRO_DRIVERS.values()
+})
 
 
 # =============================================================================
@@ -137,9 +165,42 @@ def run_full_pipeline():
         logger.critical(f"Fetch failed: {e}", exc_info=True)
         return
 
+    logger.info("\n[STEP 3.2] Fetching macro driver data (DXY, gold, US10Y, WTI, VIX)...")
+    try:
+        macro_raw_df = smart_fetch_macro()
+        if macro_raw_df.empty:
+            logger.warning(
+                "No macro driver data fetched this run — macro features "
+                "will fall back to 0.0 for every basket this scan (see "
+                "engines/macro.py's fallback behaviour). FX prices are "
+                "unaffected — continuing pipeline."
+            )
+        else:
+            logger.info(
+                f"Fetched {len(macro_raw_df)} rows for "
+                f"{macro_raw_df['pair'].nunique()} macro symbols"
+            )
+    except Exception as e:
+        # Non-fatal, matching data/fetcher.py's run_data_pipeline: a
+        # macro-source hiccup should never block the core FX pipeline.
+        logger.error(f"Macro fetch failed (non-fatal): {e} — continuing without macro data this run")
+        macro_raw_df = pd.DataFrame()
+
     logger.info("\n[STEP 3.4] Writing raw price snapshot to Supabase Storage...")
     try:
-        snapshot_ok = write_snapshot(raw_df, run_timestamp=run_start)
+        # Combine FX + macro rows into ONE snapshot write — same
+        # storage path/schema for both (see data/fetcher.py's
+        # smart_fetch_macro), so they belong in the same snapshot file
+        # rather than a separate one. Without this, macro rows would
+        # never persist to Storage, and every future run (including
+        # train_models.py's backfill) would see an empty macro history
+        # even though smart_fetch_macro() successfully fetched it.
+        if not macro_raw_df.empty:
+            snapshot_input_df = pd.concat([raw_df, macro_raw_df], ignore_index=True)
+        else:
+            snapshot_input_df = raw_df
+
+        snapshot_ok = write_snapshot(snapshot_input_df, run_timestamp=run_start)
         if snapshot_ok:
             logger.info("Snapshot written successfully")
         else:
@@ -255,6 +316,33 @@ def run_full_pipeline():
     except Exception as e:
         logger.error(f"Failed to write indicator results: {e}", exc_info=True)
 
+    logger.info("\n[STEP 7.5] Computing macro driver features per basket...")
+    # tickers_data (built in STEP 6 from working_df, which includes
+    # macro rows since STEP 3.4 now writes them into the same
+    # snapshot) already has the DXY/GOLD/US10Y/WTI/VIX entries
+    # alongside the 28 FX pairs — same dict shape
+    # get_macro_features_for_basket() expects, so it's reused directly
+    # rather than re-fetched or re-shaped.
+    macro_features_by_basket = {}
+    for basket_name in BASKETS:
+        try:
+            macro_features_by_basket[basket_name] = get_macro_features_for_basket(
+                basket_name, tickers_data,
+            )
+        except Exception as e:
+            logger.warning(
+                f"  {basket_name}: macro feature computation failed: {e} — "
+                f"this basket's macro columns will fall back to 0.0"
+            )
+            macro_features_by_basket[basket_name] = pd.DataFrame()
+
+        if macro_features_by_basket[basket_name].empty:
+            logger.warning(
+                f"  {basket_name}: no macro features this run (missing "
+                f"driver history) — falling back to 0.0 for this basket's "
+                f"macro columns"
+            )
+
     logger.info("\n[STEP 9] Running basket-grouped directional predictions...")
 
     all_predictions = []
@@ -277,6 +365,7 @@ def run_full_pipeline():
                 csi_df          = csi_df,
                 signal_datetime = scan_datetime,
                 pipeline        = pipeline,
+                macro_features_df = macro_features_by_basket.get(basket_name),
             )
 
             if not basket_predictions.empty:
