@@ -20,7 +20,7 @@ fetcher:
   # Weekly candles (fetch_interval: "1wk") have no yfinance history cap,
   # unlike intraday intervals. 9125 days (~25 years) is a deliberate
   # deep-history pull for this project, not a leftover intraday-safety value.
-  historical_days: 2106
+  historical_days: 2300
   incremental_days: 5       # buffer for weekend/holiday gaps
   fetch_interval: "1d"       # what we actually pull from yfinance
   
@@ -32,7 +32,7 @@ logging:
   max_file_size_mb: 10
 
 ml:
-  high_probability_threshold: 0.55
+  high_probability_threshold: 0.68
   # Locked: 2 weekly candles ahead (~2 weeks forward).
   label_forward_periods: 2
   min_training_samples: 50
