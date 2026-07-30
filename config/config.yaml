@@ -10,7 +10,7 @@ storage:
   # every old chunk. Bounds both total Storage bytes AND object count
   # (Supabase free tier caps both) without ever losing in-window data
   # free-tier 1GB cap even before accounting for Parquet compression.
-  retention_days: 9200
+  retention_days: 2600
 
 fetcher:
   batch_size: 25
@@ -20,9 +20,9 @@ fetcher:
   # Weekly candles (fetch_interval: "1wk") have no yfinance history cap,
   # unlike intraday intervals. 9125 days (~25 years) is a deliberate
   # deep-history pull for this project, not a leftover intraday-safety value.
-  historical_days: 9125
+  historical_days: 2106
   incremental_days: 5       # buffer for weekend/holiday gaps
-  fetch_interval: "1wk"       # what we actually pull from yfinance
+  fetch_interval: "1d"       # what we actually pull from yfinance
   
 
 logging:
