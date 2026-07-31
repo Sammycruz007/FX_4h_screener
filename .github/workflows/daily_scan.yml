@@ -17,7 +17,7 @@ on:
     # if Yahoo hadn't finalized it yet (smart_fetch has no way to tell
     # "candle not published yet" apart from "no new candle exists" —
     # both just return the same last-known row).
-    - cron: '0 3 * * *'
+    - cron: '40 12 * * *'
   # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
 
