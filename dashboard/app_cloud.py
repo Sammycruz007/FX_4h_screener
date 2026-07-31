@@ -139,6 +139,7 @@ from data.database_cloud import (
     read_latest_prediction_results,
     read_latest_model_metrics,
     get_last_fetch_dates_bulk,
+    read_prediction_outcomes,
 )
 
 # ── Initialise DB tables (safe — IF NOT EXISTS) ───────────────────────────────
@@ -382,7 +383,7 @@ if not BASKETS:
 else:
     basket_tabs = st.tabs([f"📊 {name}" for name in BASKETS.keys()])
 
-    cols_to_show = ["pair", "direction", "up_probability", "confidence"]
+    cols_to_show = ["pair", "direction", "up_probability", "confidence", "signal_status", "previous_probability"]
 
     for tab, basket_name in zip(basket_tabs, BASKETS.keys()):
         with tab:
@@ -396,6 +397,22 @@ else:
                 continue
 
             display_cols = [c for c in cols_to_show if c in basket_predictions.columns]
+
+            # Human-readable signal_status + previous_probability combo,
+            # e.g. "Continuation (was up @ 0.60)" or "Flip (was down @
+            # 0.30)" — folds two raw columns into one readable string
+            # rather than showing them as separate numeric/text columns.
+            if "signal_status" in basket_predictions.columns and "previous_probability" in basket_predictions.columns:
+                def _format_signal_status(row):
+                    status = row.get("signal_status")
+                    prev_p = row.get("previous_probability")
+                    if status == "first signal" or pd.isna(prev_p):
+                        return "First signal"
+                    label = "Continuation" if status == "continuation" else "Flip"
+                    return f"{label} (was {row['direction'] if status == 'continuation' else ('down' if row['direction']=='up' else 'up')} @ {prev_p:.2f})"
+
+                basket_predictions["Signal"] = basket_predictions.apply(_format_signal_status, axis=1)
+                display_cols = [c for c in display_cols if c not in ("signal_status", "previous_probability")] + ["Signal"]
 
             # Colour by direction: green background for "up" rows, red
             # for "down" — background_gradient alone (as the old
@@ -411,6 +428,79 @@ else:
                 use_container_width=True,
                 hide_index=True,
             )
+
+
+# =============================================================================
+# SECTION 2.5 — LIVE TRACKING
+# =============================================================================
+# Tracks REAL, ongoing prediction accuracy — separate from the
+# original backtest's AUC/precision, which only ever measured
+# historical held-out data. Once a prediction's validity window has
+# elapsed (see run_pipeline_cloud.py's STEP 8.5), the pipeline scores
+# it against the actual price move and records the outcome here. This
+# is the honest, ongoing answer to "is the deployed model actually
+# performing the way the backtest suggested it would" — the backtest
+# is a one-time historical estimate; this is live evidence that
+# accumulates over time.
+
+st.header("Live Tracking")
+st.caption(
+    "Real outcomes for expired predictions — was the direction call "
+    "actually correct? This tracks live performance separately from "
+    "the original backtest metrics shown under Model Health below."
+)
+
+outcomes_df = read_prediction_outcomes(limit_days=30)
+
+if outcomes_df.empty:
+    st.info(
+        "No scored outcomes yet — predictions are scored once their "
+        "validity window elapses (2 business days after the "
+        "prediction's candle date)."
+    )
+else:
+    # Rolling accuracy summary per basket — the headline number to
+    # compare against each basket's backtest AUC/precision over time.
+    summary = (
+        outcomes_df.groupby("basket")["outcome"]
+        .apply(lambda s: (s == "correct").mean())
+        .reset_index()
+        .rename(columns={"outcome": "accuracy"})
+    )
+    summary["n_predictions"] = outcomes_df.groupby("basket").size().values
+
+    summary_cols = st.columns(len(summary)) if len(summary) > 0 else []
+    for col, (_, row) in zip(summary_cols, summary.iterrows()):
+        with col:
+            st.metric(
+                row["basket"],
+                f"{row['accuracy']:.1%}",
+                help=f"{int(row['n_predictions'])} predictions scored in the last 30 days",
+            )
+
+    st.divider()
+
+    # Detailed outcome table — most recent first.
+    display_outcomes = outcomes_df.copy()
+    display_outcomes["prediction_datetime"] = pd.to_datetime(
+        display_outcomes["prediction_datetime"]
+    ).dt.date
+
+    outcome_cols = [
+        "pair", "basket", "prediction_datetime", "direction",
+        "up_probability", "valid_through_date", "actual_close_change", "outcome",
+    ]
+    outcome_cols = [c for c in outcome_cols if c in display_outcomes.columns]
+
+    def _highlight_outcome(row):
+        color = "#14532d" if row.get("outcome") == "correct" else "#7f1d1d"
+        return [f"background-color: {color}"] * len(row)
+
+    st.dataframe(
+        display_outcomes[outcome_cols].style.apply(_highlight_outcome, axis=1),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # =============================================================================
