@@ -212,6 +212,23 @@ def train_directional_model(
     """
     Train one basket's directional model on its labelled feature matrix.
 
+    TWO-STAGE TRAINING, per project decision:
+    1. EVALUATION: fit on the first ~70% of history (by date), measure
+       AUC/PR-AUC/precision/recall/CV scores/threshold table against
+       the held-out final ~30% (genuinely unseen data) — this is what
+       all the logged metrics describe, and is the honest answer to
+       "how well does this modeling approach generalize."
+    2. PRODUCTION: separately refit on 100% of history (train + the
+       held-out portion combined) — this is the model actually
+       returned and saved to disk. Withholding the most recent ~30%
+       of history (typically the most relevant/current data) from the
+       model that makes live predictions would be wasteful once the
+       approach has already been validated in stage 1.
+    The returned/saved model is therefore a DIFFERENT fit (different
+    weights, trained on more rows) than the one the logged metrics
+    describe — metrics measure the approach, not this exact file's
+    training data.
+
     Args:
         feature_matrix: Output of build_directional_feature_matrix()
                         for ONE basket's pairs. Must contain
@@ -220,7 +237,8 @@ def train_directional_model(
         basket_name   : e.g. 'usd', 'cad', 'chf', 'jpy', 'crosses'
 
     Returns:
-        Tuple of (trained Pipeline, metrics dict)
+        Tuple of (production Pipeline fit on full history, metrics
+        dict describing the train/held-out-OOS evaluation)
     """
     logger.info("=" * 60)
     logger.info(f"DIRECTIONAL MODEL TRAINING STARTING | Basket: {basket_name}")
@@ -390,16 +408,49 @@ def train_directional_model(
     )
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Evaluation model (train-only) is DONE at this point — pipeline
+    # above was fit on X_train/y_train (the first ~70% of history) and
+    # every metric logged so far (CV scores, OOS AUC/precision/recall,
+    # threshold table, top-5% win rate) is measured against data that
+    # model never saw. That's the correct way to measure "how well does
+    # this approach generalize" — keep all of that exactly as-is.
+    #
+    # PRODUCTION model is a SEPARATE fit, on ALL available data (X, y —
+    # train + the held-out OOS portion combined), per project decision:
+    # the 70/30 split is an evaluation methodology, not a reason to
+    # permanently withhold the most recent ~30% of history (typically
+    # the most RELEVANT/current data) from the model that actually
+    # makes live predictions. This is standard practice — validate on
+    # a holdout, then refit the final deployed artifact on everything
+    # once the approach is confirmed to work.
+    #
+    # This is a genuinely different fitted model (different weights)
+    # from the one evaluated above, since it's fit on more data — the
+    # AUC/precision/recall numbers logged above describe how well THIS
+    # APPROACH generalizes, not the exact weights being saved to disk.
+    logger.info(f"{basket_name}: refitting production model on FULL history ({len(X)} rows, train+OOS combined)...")
+
+    production_pipeline = _build_pipeline(scale_pos_weight)
+    production_pipeline.fit(X, y)
+
     model_path = MODEL_DIR / f"directional_{basket_name}.pkl"
     with open(model_path, "wb") as f:
-        pickle.dump(pipeline, f)
+        pickle.dump(production_pipeline, f)
 
-    logger.info(f"{basket_name}: model saved to {model_path}")
+    logger.info(
+        f"{basket_name}: production model saved to {model_path} | "
+        f"trained on {len(X)} rows (full history) — "
+        f"evaluation metrics above were measured on a separate "
+        f"train-only fit ({len(X_train)} rows) and describe this "
+        f"approach's expected generalization, not this exact model's "
+        f"training data"
+    )
     logger.info("=" * 60)
     logger.info(f"DIRECTIONAL MODEL TRAINING COMPLETE | Basket: {basket_name}")
     logger.info("=" * 60)
 
-    return pipeline, metrics
+    return production_pipeline, metrics
 
 
 # =============================================================================
