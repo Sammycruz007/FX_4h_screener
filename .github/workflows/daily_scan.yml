@@ -1,0 +1,90 @@
+name: Eagle Logic — Daily Scan
+
+on:
+  schedule:
+    # Daily candles (fetch_interval: "1d"), so the pipeline now needs
+    # to run every day, not weekly (this schedule was never updated
+    # when the project switched from Weekly to Daily bars — it was
+    # still '0 0 * * 1', Mondays only, which is why manual runs on
+    # non-Monday days were the only thing actually firing).
+    # 06:00 UTC daily — the standard forex daily candle closes at
+    # 17:00 ET (22:00 UTC in EST, 21:00 UTC in EDT, per the
+    # widely-followed 5pm ET convention yfinance itself uses). Waiting
+    # until 06:00 UTC gives a comfortable ~9-11 hour buffer after that
+    # close for yfinance's backend to finalize and publish the candle
+    # — 00:00 UTC (only ~2-3 hours after close) was cutting it too
+    # close and risked silently re-fetching the previous day's candle
+    # if Yahoo hadn't finalized it yet (smart_fetch has no way to tell
+    # "candle not published yet" apart from "no new candle exists" —
+    # both just return the same last-known row).
+    - cron: '0 6 * * *'
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  run_pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 600
+
+    steps:
+      # ── 1. Checkout repo ──────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python 3.11 ─────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements-cloud.txt"
+
+      # ── 3. Install dependencies ───────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      # ── 4. Run daily pipeline ─────────────────────────────────────────────
+      - name: Run Eagle Logic pipeline
+        run: python run_pipeline_cloud.py
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+      # ── 5. Retrain ML models once a week, on the weekend ──────────────────
+      # Changed from monthly to weekly per project decision, now that
+      # the pipeline runs daily instead of weekly. Saturday specifically
+      # (not Sunday): FX markets are closed all weekend, so Saturday is
+      # a natural "quiet" day with no fresh candle expected, and by
+      # then Friday's final close (the last trading day's candle) has
+      # already been fetched by Friday's 12:00 UTC run.
+      - name: Retrain ML models (weekly, Saturdays)
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$(date +%u)" = "6" ]; then
+            python ml/train_models.py
+          else
+            echo "Not Saturday — skipping retrain"
+          fi
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+      # ── 6. Commit updated models back to repo ─────────────────────────────
+      - name: Commit updated models
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        run: |
+          git config user.name  "Eagle Logic Bot"
+          git config user.email "bot@eaglelogic.com"
+          if compgen -G "models/*.pkl" > /dev/null; then
+            git add models/*.pkl
+            git diff --staged --quiet || git commit -m "chore: retrain models $(date +%Y-%m-%d)"
+            git push
+          else
+            echo "No .pkl models found — skipping commit (training didn't produce models this run, e.g. not enough price history yet, or not Saturday's weekly retrain)"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN}}
