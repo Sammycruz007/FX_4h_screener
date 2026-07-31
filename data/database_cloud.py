@@ -22,6 +22,17 @@ TABLES STORED IN SUPABASE:
   cleared the display threshold)
 - model_metrics       (per-basket ML model performance)
 - fetch_tracker       (per-pair incremental-fetch bookkeeping)
+- all_predictions_log (EVERY basket-model prediction, every run,
+  regardless of display threshold — added for live-tracking/
+  continuation-vs-flip comparisons, since prediction_results only
+  ever holds threshold-clearing rows and can't answer "what did this
+  pair predict yesterday" if yesterday's prediction happened to be
+  sub-threshold)
+- prediction_outcomes (once a prediction's validity window has
+  elapsed, whether price actually moved in the predicted direction —
+  the live accuracy tracker, evaluated against actual closes as they
+  become available, separate from the original backtest's AUC/
+  precision, which only ever measured historical held-out data)
 
 WHAT'S DIFFERENT FROM THE PRIOR (SIGNAL RANKER SCANNER) VERSION OF
 THIS FILE — THIS IS A REDESIGN OF THE SCHEMA, NOT A RENAME:
@@ -140,14 +151,16 @@ def initialise_database() -> None:
         """,
         """
         CREATE TABLE IF NOT EXISTS prediction_results (
-            id             SERIAL PRIMARY KEY,
-            pair           TEXT NOT NULL,
-            datetime       TIMESTAMPTZ NOT NULL,
-            basket         TEXT NOT NULL,
-            up_probability REAL NOT NULL,
-            direction      TEXT NOT NULL,
-            confidence     REAL NOT NULL,
-            created_at     TIMESTAMP DEFAULT NOW(),
+            id                   SERIAL PRIMARY KEY,
+            pair                 TEXT NOT NULL,
+            datetime             TIMESTAMPTZ NOT NULL,
+            basket               TEXT NOT NULL,
+            up_probability       REAL NOT NULL,
+            direction            TEXT NOT NULL,
+            confidence           REAL NOT NULL,
+            signal_status        TEXT,
+            previous_probability REAL,
+            created_at           TIMESTAMP DEFAULT NOW(),
             UNIQUE(pair, datetime, basket)
         )
         """,
@@ -170,6 +183,34 @@ def initialise_database() -> None:
             pair            TEXT PRIMARY KEY,
             last_fetch_date DATE NOT NULL,
             updated_at      TIMESTAMP DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS all_predictions_log (
+            id             SERIAL PRIMARY KEY,
+            pair           TEXT NOT NULL,
+            datetime       TIMESTAMPTZ NOT NULL,
+            basket         TEXT NOT NULL,
+            up_probability REAL NOT NULL,
+            direction      TEXT NOT NULL,
+            created_at     TIMESTAMP DEFAULT NOW(),
+            UNIQUE(pair, datetime, basket)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS prediction_outcomes (
+            id                  SERIAL PRIMARY KEY,
+            pair                TEXT NOT NULL,
+            basket              TEXT NOT NULL,
+            prediction_datetime TIMESTAMPTZ NOT NULL,
+            direction           TEXT NOT NULL,
+            up_probability      REAL NOT NULL,
+            valid_through_date  DATE NOT NULL,
+            actual_close_change REAL,
+            outcome             TEXT,
+            evaluated_at        TIMESTAMP,
+            created_at          TIMESTAMP DEFAULT NOW(),
+            UNIQUE(pair, basket, prediction_datetime)
         )
         """,
     ]
@@ -283,8 +324,84 @@ def write_prediction_results(df: pd.DataFrame, run_datetime: str) -> int:
 
     Args:
         df          : Prediction output [pair, basket, up_probability,
-                      direction, confidence]
+                      direction, confidence, signal_status,
+                      previous_probability]. The last two are optional
+                      — added for live-tracking continuation/flip
+                      display; older callers or a df missing these
+                      columns still work (they'll be written as NULL).
         run_datetime: ISO timestamp string of the weekly candle this
+                      prediction run evaluated
+
+    Returns:
+        Number of rows written
+    """
+    if df.empty:
+        return 0
+
+    records = []
+    for _, row in df.iterrows():
+        records.append({
+            "pair"                 : row["pair"],
+            "datetime"             : run_datetime,
+            "basket"               : row["basket"],
+            "up_probability"       : float(row["up_probability"]),
+            "direction"            : row["direction"],
+            "confidence"           : float(row["confidence"]),
+            "signal_status"        : row.get("signal_status"),
+            "previous_probability" : (
+                float(row["previous_probability"])
+                if pd.notna(row.get("previous_probability"))
+                else None
+            ),
+        })
+
+    sql = """
+        INSERT INTO prediction_results (
+            pair, datetime, basket, up_probability, direction, confidence,
+            signal_status, previous_probability
+        ) VALUES (
+            %(pair)s, %(datetime)s, %(basket)s, %(up_probability)s,
+            %(direction)s, %(confidence)s, %(signal_status)s,
+            %(previous_probability)s
+        )
+        ON CONFLICT (pair, datetime, basket) DO UPDATE SET
+            up_probability       = EXCLUDED.up_probability,
+            direction            = EXCLUDED.direction,
+            confidence           = EXCLUDED.confidence,
+            signal_status        = EXCLUDED.signal_status,
+            previous_probability = EXCLUDED.previous_probability
+    """
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        psycopg2.extras.execute_batch(cursor, sql, records, page_size=500)
+
+    logger.info(f"write_prediction_results: {len(records)} predictions written for {run_datetime}")
+    return len(records)
+
+
+def write_all_predictions_log(df: pd.DataFrame, run_datetime: str) -> int:
+    """
+    Upsert EVERY basket-model prediction for one run, regardless of
+    whether it cleared the display threshold — the raw feed backing
+    live-tracking's continuation-vs-flip comparison.
+
+    WHY THIS IS A SEPARATE TABLE FROM prediction_results: that table
+    only ever holds threshold-clearing rows (by design — see its own
+    docstring above). If pair X predicted BUY at 0.60 yesterday
+    (below threshold, never written to prediction_results) and BUY at
+    0.70 today (clears threshold, shown on the dashboard), there would
+    be no way to look up "what did X predict yesterday" to correctly
+    label today's prediction as a CONTINUATION rather than a first
+    signal — prediction_results simply wouldn't have yesterday's row
+    at all. This table holds ALL 28 pairs' raw probabilities every
+    single run specifically so that lookup always succeeds.
+
+    Args:
+        df          : ALL basket predictions for this run (not just
+                      threshold-clearing ones) — [pair, basket,
+                      up_probability, direction]
+        run_datetime: ISO timestamp string of the candle this
                       prediction run evaluated
 
     Returns:
@@ -301,27 +418,25 @@ def write_prediction_results(df: pd.DataFrame, run_datetime: str) -> int:
             "basket"         : row["basket"],
             "up_probability" : float(row["up_probability"]),
             "direction"      : row["direction"],
-            "confidence"     : float(row["confidence"]),
         })
 
     sql = """
-        INSERT INTO prediction_results (
-            pair, datetime, basket, up_probability, direction, confidence
+        INSERT INTO all_predictions_log (
+            pair, datetime, basket, up_probability, direction
         ) VALUES (
             %(pair)s, %(datetime)s, %(basket)s, %(up_probability)s,
-            %(direction)s, %(confidence)s
+            %(direction)s
         )
         ON CONFLICT (pair, datetime, basket) DO UPDATE SET
             up_probability = EXCLUDED.up_probability,
-            direction      = EXCLUDED.direction,
-            confidence     = EXCLUDED.confidence
+            direction      = EXCLUDED.direction
     """
 
     with get_connection() as conn:
         cursor = conn.cursor()
         psycopg2.extras.execute_batch(cursor, sql, records, page_size=500)
 
-    logger.info(f"write_prediction_results: {len(records)} predictions written for {run_datetime}")
+    logger.info(f"write_all_predictions_log: {len(records)} predictions logged for {run_datetime}")
     return len(records)
 
 
@@ -352,6 +467,149 @@ def write_model_metrics(
         cursor.execute(sql, (model_name, train_date, precision, recall, pr_auc, auc_roc, n_samples))
 
     logger.info(f"write_model_metrics: {model_name} written")
+
+
+def get_previous_predictions(pair_basket_pairs: list) -> dict:
+    """
+    For each (pair, basket) tuple, look up that pair's MOST RECENT
+    prior prediction from all_predictions_log — regardless of whether
+    it cleared the display threshold — for continuation-vs-flip
+    comparison against today's fresh prediction.
+
+    Args:
+        pair_basket_pairs: List of (pair, basket) tuples to look up,
+                           e.g. [("EURUSD", "usd"), ("AUDCHF", "chf")]
+
+    Returns:
+        Dict mapping (pair, basket) -> {"direction": ..., 
+        "up_probability": ..., "datetime": ...} for the most recent
+        prior row found, OR omitted entirely if no prior row exists
+        for that pair (e.g. a brand new pair, or a gap in fetch
+        history) — caller should treat a missing key as "no prior
+        prediction available," not as any particular direction.
+    """
+    if not pair_basket_pairs:
+        return {}
+
+    sql = """
+        SELECT DISTINCT ON (pair, basket)
+            pair, basket, direction, up_probability, datetime
+        FROM all_predictions_log
+        WHERE (pair, basket) IN %s
+        ORDER BY pair, basket, datetime DESC
+    """
+
+    with get_connection() as conn:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cursor.execute(sql, (tuple(pair_basket_pairs),))
+        rows = cursor.fetchall()
+
+    return {
+        (row["pair"], row["basket"]): {
+            "direction"      : row["direction"],
+            "up_probability" : row["up_probability"],
+            "datetime"       : row["datetime"],
+        }
+        for row in rows
+    }
+
+
+def write_prediction_outcomes(records: list) -> int:
+    """
+    Insert prediction-outcome rows once a prediction's validity window
+    has elapsed and the actual price move is known.
+
+    Args:
+        records: List of dicts with keys pair, basket,
+                prediction_datetime, direction, up_probability,
+                valid_through_date, actual_close_change, outcome
+                ("correct"/"incorrect")
+
+    Returns:
+        Number of rows written
+    """
+    if not records:
+        return 0
+
+    sql = """
+        INSERT INTO prediction_outcomes (
+            pair, basket, prediction_datetime, direction, up_probability,
+            valid_through_date, actual_close_change, outcome, evaluated_at
+        ) VALUES (
+            %(pair)s, %(basket)s, %(prediction_datetime)s, %(direction)s,
+            %(up_probability)s, %(valid_through_date)s,
+            %(actual_close_change)s, %(outcome)s, NOW()
+        )
+        ON CONFLICT (pair, basket, prediction_datetime) DO UPDATE SET
+            actual_close_change = EXCLUDED.actual_close_change,
+            outcome             = EXCLUDED.outcome,
+            evaluated_at        = NOW()
+    """
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        psycopg2.extras.execute_batch(cursor, sql, records, page_size=500)
+
+    logger.info(f"write_prediction_outcomes: {len(records)} outcomes recorded")
+    return len(records)
+
+
+def read_unevaluated_predictions(as_of_date: str) -> pd.DataFrame:
+    """
+    Find predictions whose validity window has elapsed (valid_through_date
+    < as_of_date, i.e. genuinely expired, not just close to expiring) but
+    that don't have an outcome recorded yet — these are ready to be
+    scored against actual price data.
+
+    Only looks at predictions that cleared the display threshold
+    (prediction_results), since those are the only ones the live
+    accuracy tracker needs to grade — sub-threshold rows in
+    all_predictions_log exist purely for continuation lookups, not for
+    outcome tracking.
+
+    Args:
+        as_of_date: Today's date as 'YYYY-MM-DD' — predictions whose
+                   valid_through_date is before this are due for
+                   evaluation.
+
+    Returns:
+        DataFrame [pair, basket, datetime, direction, up_probability],
+        one row per prediction awaiting evaluation.
+    """
+    sql = """
+        SELECT pr.pair, pr.basket, pr.datetime, pr.direction, pr.up_probability
+        FROM prediction_results pr
+        LEFT JOIN prediction_outcomes po
+            ON pr.pair = po.pair
+            AND pr.basket = po.basket
+            AND pr.datetime = po.prediction_datetime
+        WHERE po.id IS NULL
+        ORDER BY pr.datetime ASC
+    """
+    with get_connection() as conn:
+        return pd.read_sql(sql, conn)
+
+
+def read_prediction_outcomes(limit_days: int = 30) -> pd.DataFrame:
+    """
+    Read recent scored prediction outcomes for the live-tracking
+    dashboard section — the actual "how is this doing in production"
+    view, separate from the original backtest's AUC/precision.
+
+    Args:
+        limit_days: Only return outcomes for predictions made in the
+                   last N days.
+
+    Returns:
+        DataFrame ordered by prediction_datetime descending.
+    """
+    sql = """
+        SELECT * FROM prediction_outcomes
+        WHERE prediction_datetime >= NOW() - INTERVAL '%s days'
+        ORDER BY prediction_datetime DESC
+    """
+    with get_connection() as conn:
+        return pd.read_sql(sql, conn, params=(limit_days,))
 
 
 # =============================================================================
