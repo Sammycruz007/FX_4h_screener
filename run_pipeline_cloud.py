@@ -83,6 +83,10 @@ from data.database_cloud import (
     initialise_database,
     write_indicator_results,
     write_prediction_results,
+    write_all_predictions_log,
+    get_previous_predictions,
+    read_unevaluated_predictions,
+    write_prediction_outcomes,
 )
 from data.storage_cloud import write_snapshot, consolidate_snapshots, read_price_history
 
@@ -115,6 +119,21 @@ MACRO_CFG    = config["macro"]
 
 RETENTION_DAYS     = STORAGE_CFG["retention_days"]
 DISPLAY_THRESHOLD  = ML_CFG["high_probability_threshold"]
+LABEL_FORWARD_PERIODS = ML_CFG["label_forward_periods"]  # 2 business days ahead, daily bars
+
+import datetime as _datetime
+
+def _add_business_days(start_date: _datetime.date, n: int) -> _datetime.date:
+    """Add n business days (Mon-Fri) to start_date, skipping weekends —
+    matches dashboard/app_cloud.py's identical helper, used here to
+    compute each prediction's valid_through_date for outcome tracking."""
+    current = start_date
+    added   = 0
+    while added < n:
+        current += _datetime.timedelta(days=1)
+        if current.weekday() < 5:
+            added += 1
+    return current
 BASKETS            = UNIVERSE_CFG["baskets"]
 
 MACRO_DRIVERS         = MACRO_CFG["drivers"]
@@ -343,6 +362,65 @@ def run_full_pipeline():
                 f"macro columns"
             )
 
+    logger.info("\n[STEP 8.5] Evaluating outcomes for expired predictions...")
+    try:
+        today_date = scan_datetime.date() if hasattr(scan_datetime, "date") else pd.Timestamp(scan_datetime).date()
+        unevaluated = read_unevaluated_predictions(as_of_date=today_date.isoformat())
+
+        if unevaluated.empty:
+            logger.info("No predictions awaiting outcome evaluation")
+        else:
+            outcome_records = []
+            for _, pred_row in unevaluated.iterrows():
+                pred_date = pd.Timestamp(pred_row["datetime"]).date()
+                valid_through = _add_business_days(pred_date, LABEL_FORWARD_PERIODS)
+
+                # Only evaluate predictions whose window has GENUINELY
+                # elapsed (today is after valid_through) — not ones
+                # still in-flight, which read_unevaluated_predictions'
+                # SQL already filters for, but double-checked here
+                # since valid_through is computed in Python, not SQL.
+                if today_date <= valid_through:
+                    continue
+
+                pair_prices = working_df[working_df["pair"] == pred_row["pair"]].sort_values("datetime")
+                price_at_prediction = pair_prices[pair_prices["datetime"] <= pd.Timestamp(pred_row["datetime"], tz="UTC")]
+                price_at_expiry = pair_prices[pair_prices["datetime"] <= pd.Timestamp(valid_through, tz="UTC")]
+
+                if price_at_prediction.empty or price_at_expiry.empty:
+                    logger.warning(
+                        f"  {pred_row['pair']}: insufficient price history to "
+                        f"evaluate outcome — skipping this run, will retry next run"
+                    )
+                    continue
+
+                close_at_prediction = price_at_prediction.iloc[-1]["close"]
+                close_at_expiry     = price_at_expiry.iloc[-1]["close"]
+                actual_change       = float((close_at_expiry - close_at_prediction) / close_at_prediction)
+
+                predicted_up = pred_row["direction"] == "up"
+                actual_up    = actual_change > 0
+                outcome      = "correct" if predicted_up == actual_up else "incorrect"
+
+                outcome_records.append({
+                    "pair"                : pred_row["pair"],
+                    "basket"              : pred_row["basket"],
+                    "prediction_datetime" : pred_row["datetime"],
+                    "direction"           : pred_row["direction"],
+                    "up_probability"      : float(pred_row["up_probability"]),
+                    "valid_through_date"  : valid_through.isoformat(),
+                    "actual_close_change" : round(actual_change, 6),
+                    "outcome"             : outcome,
+                })
+
+            if outcome_records:
+                written = write_prediction_outcomes(outcome_records)
+                logger.info(f"Outcomes evaluated and recorded: {written}")
+            else:
+                logger.info("No predictions had both expired AND had sufficient price history yet")
+    except Exception as e:
+        logger.error(f"Outcome evaluation failed (non-fatal): {e}", exc_info=True)
+
     logger.info("\n[STEP 9] Running basket-grouped directional predictions...")
 
     all_predictions = []
@@ -391,6 +469,17 @@ def run_full_pipeline():
         lambda p: p if p >= 0.5 else 1 - p
     )
 
+    # Log EVERY prediction (all 28 pairs, regardless of threshold) —
+    # this is the raw feed continuation/flip comparisons read from,
+    # since prediction_results (below) only ever holds threshold-
+    # clearing rows and can't answer "what did this pair predict
+    # yesterday" if yesterday's happened to be sub-threshold.
+    try:
+        log_rows = write_all_predictions_log(predictions_df, run_datetime=scan_datetime)
+        logger.info(f"All-predictions log written: {log_rows} rows")
+    except Exception as e:
+        logger.error(f"Failed to write all-predictions log (non-fatal): {e}", exc_info=True)
+
     display_df = predictions_df[predictions_df["confidence"] >= DISPLAY_THRESHOLD].copy()
 
     logger.info(
@@ -398,11 +487,39 @@ def run_full_pipeline():
         f"{len(display_df)}/{len(predictions_df)}"
     )
 
+    # Continuation vs flip — for each DISPLAYED prediction, look up
+    # that pair's most recent PRIOR prediction (any probability, not
+    # just threshold-clearing) from all_predictions_log. This answers
+    # "is today's signal a continuation of yesterday's direction, or a
+    # flip" even when yesterday's prediction never appeared on the
+    # dashboard because it was below threshold.
+    if not display_df.empty:
+        lookup_pairs = list(zip(display_df["pair"], display_df["basket"]))
+        try:
+            previous = get_previous_predictions(lookup_pairs)
+        except Exception as e:
+            logger.error(f"Failed to fetch previous predictions for continuation check (non-fatal): {e}", exc_info=True)
+            previous = {}
+
+        def _continuation_label(row):
+            prior = previous.get((row["pair"], row["basket"]))
+            if prior is None or prior["datetime"] == scan_datetime:
+                # No prior row, or the only "prior" row is this same
+                # run (e.g. first time this pair has ever been logged)
+                return "first signal", None
+            if prior["direction"] == row["direction"]:
+                return "continuation", prior["up_probability"]
+            return "flip", prior["up_probability"]
+
+        labels = display_df.apply(_continuation_label, axis=1, result_type="expand")
+        display_df["signal_status"]        = labels[0]
+        display_df["previous_probability"] = labels[1]
+
     if not display_df.empty:
         display_df = display_df.sort_values("confidence", ascending=False).reset_index(drop=True)
         logger.info(
             f"Top display predictions:\n"
-            f"{display_df[['pair','basket','direction','confidence']].to_string(index=False)}"
+            f"{display_df[['pair','basket','direction','confidence','signal_status']].to_string(index=False)}"
         )
 
     logger.info("\n[STEP 10] Writing display-threshold predictions to Supabase...")
