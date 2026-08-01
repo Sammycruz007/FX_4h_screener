@@ -235,6 +235,19 @@ def initialise_database() -> None:
         "ALTER TABLE indicator_results DROP COLUMN IF EXISTS price_sd_position",
         "ALTER TABLE indicator_results DROP COLUMN IF EXISTS smc_structure",
         "ALTER TABLE indicator_results DROP COLUMN IF EXISTS has_valid_zone",
+        # prediction_results already existed in deployed instances before
+        # signal_status/previous_probability were added to its
+        # CREATE TABLE statement above — CREATE TABLE IF NOT EXISTS is a
+        # no-op against an already-existing table, so those columns
+        # never actually got added anywhere they were deployed before
+        # this line existed, and every write_prediction_results() call
+        # failed outright with "column does not exist" (silently, since
+        # run_pipeline_cloud.py's STEP 10 catches and logs the
+        # exception rather than crashing the whole run). Explicit
+        # ADD COLUMN IF NOT EXISTS here is the fix, and is safe to
+        # rerun indefinitely on every initialise_database() call.
+        "ALTER TABLE prediction_results ADD COLUMN IF NOT EXISTS signal_status TEXT",
+        "ALTER TABLE prediction_results ADD COLUMN IF NOT EXISTS previous_probability REAL",
     ]
 
     with get_connection() as conn:
