@@ -4,6 +4,68 @@ run_pipeline_cloud.py
 Main orchestrator for the FX directional-prediction cloud pipeline
 (GitHub Actions).
 
+WHAT'S DIFFERENT FROM THE PRIOR (SIGNAL RANKER SCANNER) VERSION —
+THIS IS A COMPLETE REDESIGN, NOT AN INCREMENTAL CHANGE:
+
+1. WEEKLY, NOT 4H. data/fetcher.py now fetches native Weekly bars — no
+   1H fetch, no session-anchored resampling. See that module's
+   docstring.
+
+2. NO LINREG, NO SMC, NO SCANNER, NO CANDIDATES. The prior pipeline's
+   steps for LinReg + SMC per pair, the scanner slope+SD-zone gate,
+   and direction-aware candlestick-at-extreme computed only for
+   candidates are GONE ENTIRELY. There is no "setup" or "candidate"
+   concept in this design — every pair in every basket gets an
+   unconditional up/down PREDICTION every run. Candlestick features
+   are now RAW pattern flags (is_hammer, is_shooting_star), computed
+   for every pair up front alongside ADX/CSI, with no gating logic and
+   no dependency on a scanner result that no longer exists (see
+   ml/features.py and engines/candlestick.py's module docstrings).
+
+3. FIVE BASKET MODELS, NOT ONE SIGNAL RANKER. ML scoring now loops
+   over config.yaml's universe.baskets, calling
+   ml.signal_ranker.predict_direction() once per basket — each basket
+   has its OWN trained model (models/directional_{basket_name}.pkl),
+   scored only against that basket's own pairs.
+
+4. DISPLAY THRESHOLD APPLIED HERE, EXPLICITLY, NOT INSIDE THE MODEL.
+   Per project decision: each model only surfaces a prediction if its
+   probability of success passes the configured threshold (e.g.
+   >=70%), and only THAT gets displayed on the dashboard.
+   predict_direction() itself returns EVERY pair's raw probability,
+   unfiltered — this orchestrator is where config.yaml's
+   ml.high_probability_threshold is actually applied, so that decision
+   lives in exactly one place, not duplicated or buried in the model.
+
+5. Every pair gets a row in indicator_results (ADX + CSI + candlestick
+   flags), but prediction_results (replacing the old scan_results
+   table) ONLY includes rows that (a) had enough history to score at
+   all and (b) cleared the display threshold. Rows that didn't clear
+   the threshold are NOT written.
+
+6. MACRO DRIVERS WIRED IN (per project decision, after comparing
+   against the EURUSD reference project's feature set):
+   - STEP 3.2 fetches macro driver data (DXY, gold, US10Y, WTI, VIX)
+     via data.fetcher.smart_fetch_macro(), right after the FX fetch.
+     Kept non-fatal — a macro-source hiccup never blocks the FX
+     pipeline (matches data/fetcher.py's own run_data_pipeline).
+   - STEP 3.4's snapshot write now includes macro rows alongside FX
+     rows (same storage schema), so macro history actually persists
+     to Storage for future runs (including ml/train_models.py's
+     backfill) to read back — without this, smart_fetch_macro()
+     fetching successfully wouldn't be enough; the data has to be
+     written too.
+   - STEP 7.5 computes each basket's macro features via
+     engines.macro.get_macro_features_for_basket(), reusing STEP 6's
+     tickers_data dict directly (it already contains the macro
+     symbols alongside the 28 FX pairs, since working_df was read
+     back from the same Storage snapshot).
+   - STEP 9 passes each basket's macro_features_df into
+     predict_direction(), which threads it into
+     compute_directional_features() the same way training does.
+
+COLUMN NAMING (pair/datetime, not ticker/date):
+   Consistent with every other file in this project.
 """
 
 import os

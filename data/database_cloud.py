@@ -8,6 +8,72 @@ Used by:
 - run_pipeline_cloud.py  (GitHub Actions)
 - dashboard/app_cloud.py (Streamlit Cloud)
 
+DIFFERENCE FROM database.py:
+- Uses psycopg2 (PostgreSQL) instead of sqlite3
+- Reads connection string from SUPABASE_DB_URL environment variable
+- Only stores RESULT tables (no raw_prices — too large for Supabase
+  free tier). Raw Weekly OHLC lives in Supabase Storage as Parquet
+  snapshots instead (see data/storage_cloud.py), not here.
+
+TABLES STORED IN SUPABASE:
+- indicator_results   (ADX + CSI + candlestick pattern flags per pair
+  per weekly-candle datetime)
+- prediction_results  (basket-model directional predictions that
+  cleared the display threshold)
+- model_metrics       (per-basket ML model performance)
+- fetch_tracker       (per-pair incremental-fetch bookkeeping)
+- all_predictions_log (EVERY basket-model prediction, every run,
+  regardless of display threshold — added for live-tracking/
+  continuation-vs-flip comparisons, since prediction_results only
+  ever holds threshold-clearing rows and can't answer "what did this
+  pair predict yesterday" if yesterday's prediction happened to be
+  sub-threshold)
+- prediction_outcomes (once a prediction's validity window has
+  elapsed, whether price actually moved in the predicted direction —
+  the live accuracy tracker, evaluated against actual closes as they
+  become available, separate from the original backtest's AUC/
+  precision, which only ever measured historical held-out data)
+
+WHAT'S DIFFERENT FROM THE PRIOR (SIGNAL RANKER SCANNER) VERSION OF
+THIS FILE — THIS IS A REDESIGN OF THE SCHEMA, NOT A RENAME:
+
+1. indicator_results DROPS EVERY LINREG/SMC COLUMN. LinReg and SMC are
+   dropped from this project's scope entirely (per project decision —
+   see ml/features.py's module docstring). This table no longer has
+   linreg_value, linreg_slope, linreg_slope_up, sd1/2/3_upper/lower,
+   price_sd_position, smc_structure, has_valid_zone — none of these
+   are computed anywhere in the pipeline anymore. What remains:
+   adx_value/plus_di/minus_di, the 6 CSI columns, and
+   is_hammer/is_shooting_star (now raw pattern flags with no extreme
+   gate — see engines/candlestick.py's compute_raw_pattern_flags).
+
+2. scan_results IS GONE, REPLACED BY prediction_results. The old table
+   held scanner CANDIDATES (pair, direction, sd_position,
+   has_valid_zone, ml_score, ml_rank) — that whole concept no longer
+   exists. prediction_results holds basket-model directional
+   PREDICTIONS instead: (pair, datetime, basket, up_probability,
+   direction, confidence). Key differences:
+     - Keyed on (pair, datetime, BASKET) not (pair, datetime,
+       direction) — a pair belongs to exactly one basket, and the
+       basket identity matters for knowing which model produced a
+       given prediction.
+     - up_probability is the model's raw output; direction ("up"/
+       "down") and confidence (symmetric around 0.5) are DERIVED from
+       it, not independently modeled.
+     - This table ONLY EVER holds rows that already cleared the
+       display threshold (config.yaml's ml.high_probability_threshold)
+       — per project decision, rows that don't clear it are never
+       written here at all. The old scan_results table held EVERY
+       candidate regardless of ml_score; this is a deliberate change.
+
+3. model_metrics is UNCHANGED IN SCHEMA — model_name now holds values
+   like "directional_basket1_usd" instead of "signal_ranker", but the
+   table structure needed no changes — it was already model-agnostic.
+
+4. fetch_tracker is UNCHANGED — still keyed on plain pair name.
+
+COLUMN NAMING (pair/datetime, not ticker/date):
+   Consistent with every other FX file.
 """
 
 import os
