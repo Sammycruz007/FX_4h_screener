@@ -469,17 +469,6 @@ def run_full_pipeline():
         lambda p: p if p >= 0.5 else 1 - p
     )
 
-    # Log EVERY prediction (all 28 pairs, regardless of threshold) —
-    # this is the raw feed continuation/flip comparisons read from,
-    # since prediction_results (below) only ever holds threshold-
-    # clearing rows and can't answer "what did this pair predict
-    # yesterday" if yesterday's happened to be sub-threshold.
-    try:
-        log_rows = write_all_predictions_log(predictions_df, run_datetime=scan_datetime)
-        logger.info(f"All-predictions log written: {log_rows} rows")
-    except Exception as e:
-        logger.error(f"Failed to write all-predictions log (non-fatal): {e}", exc_info=True)
-
     display_df = predictions_df[predictions_df["confidence"] >= DISPLAY_THRESHOLD].copy()
 
     logger.info(
@@ -493,6 +482,25 @@ def run_full_pipeline():
     # "is today's signal a continuation of yesterday's direction, or a
     # flip" even when yesterday's prediction never appeared on the
     # dashboard because it was below threshold.
+    #
+    # CRITICAL ORDERING: this lookup MUST happen BEFORE today's own
+    # predictions are written to all_predictions_log below. Doing it
+    # after (as an earlier version of this code did) meant
+    # get_previous_predictions() would find TODAY's own just-written
+    # row as the "most recent prior prediction" for every pair — since
+    # it orders by datetime DESC and today's row is now the newest —
+    # producing "continuation" labels that compared each prediction
+    # against ITSELF (same direction and probability, trivially
+    # "continuation" every single time, which is exactly the bug
+    # reported: EURAUD/GBPNZD showing "was up @ 0.81"/"was up @ 0.82"
+    # matching their OWN current probability, even on pairs whose
+    # actual prior signal was a SELL). The previous code had a
+    # `prior["datetime"] == scan_datetime` guard meant to catch this,
+    # but relying on exact datetime equality to detect "is this row
+    # the one I just wrote" is fragile (this project has hit tz-aware
+    # vs tz-naive comparison bugs before) — reordering so the lookup
+    # simply cannot see today's row removes the failure mode
+    # structurally instead of guarding against it.
     if not display_df.empty:
         lookup_pairs = list(zip(display_df["pair"], display_df["basket"]))
         try:
@@ -503,9 +511,9 @@ def run_full_pipeline():
 
         def _continuation_label(row):
             prior = previous.get((row["pair"], row["basket"]))
-            if prior is None or prior["datetime"] == scan_datetime:
-                # No prior row, or the only "prior" row is this same
-                # run (e.g. first time this pair has ever been logged)
+            if prior is None:
+                # No prior row exists at all for this pair (first time
+                # ever logged, or a gap in fetch history).
                 return "first signal", None
             if prior["direction"] == row["direction"]:
                 return "continuation", prior["up_probability"]
@@ -514,6 +522,19 @@ def run_full_pipeline():
         labels = display_df.apply(_continuation_label, axis=1, result_type="expand")
         display_df["signal_status"]        = labels[0]
         display_df["previous_probability"] = labels[1]
+
+    # Log EVERY prediction (all 28 pairs, regardless of threshold) —
+    # this is the raw feed continuation/flip comparisons read from,
+    # since prediction_results (below) only ever holds threshold-
+    # clearing rows and can't answer "what did this pair predict
+    # yesterday" if yesterday's happened to be sub-threshold. Written
+    # AFTER the continuation lookup above, deliberately — see the note
+    # above explaining why this order matters.
+    try:
+        log_rows = write_all_predictions_log(predictions_df, run_datetime=scan_datetime)
+        logger.info(f"All-predictions log written: {log_rows} rows")
+    except Exception as e:
+        logger.error(f"Failed to write all-predictions log (non-fatal): {e}", exc_info=True)
 
     if not display_df.empty:
         display_df = display_df.sort_values("confidence", ascending=False).reset_index(drop=True)
