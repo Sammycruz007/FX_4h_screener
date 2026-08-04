@@ -1,4 +1,4 @@
-name: Eagle Logic — Daily Scan
+name: Eagle Logic — Daily Predict
 
 on:
   schedule:
@@ -11,7 +11,7 @@ on:
     # 00:00 UTC — Asian/Tokyo session open
     # 12:00 UTC — London session in full swing, pre-NY open
     # 20:00 UTC — NY session close, next 4H candle forming into Asia
-    - cron: '0 0 * * 1,2,3,4,5'
+    - cron: '0 0,12,20 * * 1,2,3,4,5'
   # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
 
@@ -39,40 +39,13 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements_cloud.txt
 
-      # ── 4. Run daily pipeline ─────────────────────────────────────────────
+      # ── 4. Run daily fetch + predict pipeline ─────────────────────────────
+      # This is fetch + indicator engines + prediction ONLY. Model
+      # training never happens here — see train_models.yml, a fully
+      # separate workflow on its own weekly schedule.
       - name: Run Eagle Logic pipeline
         run: python run_pipeline_cloud.py
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-
-      # ── 5. Retrain ML models once a month ──────────────────────────────────
-      - name: Retrain ML models (monthly)
-        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$(date +%d)" -le "03" ]; then
-            python ml/train_models.py
-          else
-            echo "Not within the first 3 days of the month — skipping retrain"
-          fi
-        env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-
-      # ── 6. Commit updated models back to repo ─────────────────────────────
-      - name: Commit updated models
-        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-        run: |
-          git config user.name  "Eagle Logic Bot"
-          git config user.email "bot@eaglelogic.com"
-          if compgen -G "models/*.pkl" > /dev/null; then
-            git add models/*.pkl
-            git diff --staged --quiet || git commit -m "chore: retrain models $(date +%Y-%m-%d)"
-            git push
-          else
-            echo "No .pkl models found — skipping commit (training didn't produce models this run, e.g. not enough price history yet, or not Monday)"
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN}}

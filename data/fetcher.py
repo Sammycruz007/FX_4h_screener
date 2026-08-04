@@ -13,10 +13,22 @@ UNIVERSE SOURCING (fixed, not discovered):
    `universe.pairs` gets fetched and scanned directly. The universe comes
    straight from config, not from any external source.
 
-FETCH INTERVAL (Daily):
-   We fetch native Daily (1D) data from yfinance. Unlike 1H data, daily data 
-   has no 730-day yfinance ceiling, allowing us to seamlessly fetch 8+ years 
-   of historical data in a single request. 
+FETCH INTERVAL (Weekly):
+   We fetch native Weekly (1wk) data from yfinance, NOT a resample of a
+   finer interval. This is a deliberate switch away from this project's
+   earlier 1H-fetched-and-resampled-to-4H design — the model's target
+   horizon moved to "next 2 weekly candles," so the natural fetch unit
+   moved with it. Like Daily, Weekly data has no yfinance ceiling the way
+   1H data does (that ceiling was the whole reason the old design fetched
+   1H and resampled rather than just asking yfinance directly) — a single
+   request can pull decades of weekly bars.
+
+   NO RESAMPLING, NO SESSION-ANCHORING: the old 4H design needed
+   session-anchored resampling specifically to handle a partial Sunday-
+   open 1H candle cleanly rolling up into 4H buckets. Native weekly bars
+   from yfinance don't have an equivalent problem — a week is a week,
+   yfinance handles the bucket boundaries itself, and there is no
+   intermediate interval being rolled up here at all.
 
 WHAT'S DROPPED FROM THE STOCK PROJECT (deliberately, not oversight):
    - NASDAQ FTP universe discovery         → fixed 28-pair list from config
@@ -25,7 +37,10 @@ WHAT'S DROPPED FROM THE STOCK PROJECT (deliberately, not oversight):
    - `filters` / `indices` / `sectors` config sections → removed upstream
 
 SMART FETCH (unchanged in shape from the stock project):
-   First run  → full HISTORICAL_DAYS of 1D history per pair
+   First run  → full HISTORICAL_DAYS of weekly history per pair (config
+                now sized for a long weekly lookback — e.g. 25 years —
+                since weekly bars carry no yfinance-imposed ceiling and
+                the basket models want a long, multi-regime window)
    Later runs → incremental INCREMENTAL_DAYS fetch for pairs already tracked
 
 PARALLEL BATCHING (unchanged in shape, smaller in scale):
@@ -33,6 +48,15 @@ PARALLEL BATCHING (unchanged in shape, smaller in scale):
    With only 28 pairs total this typically means a single batch, but the
    batching/threading code is kept identical to the stock project for
    consistency and in case the universe list grows.
+
+MACRO DRIVERS (added alongside the basket redesign):
+   Alongside the 28 FX pairs, this module also fetches a small set of
+   external macro drivers (DXY, gold, US 10Y yield, WTI crude, VIX) —
+   see config.yaml's `macro` section. These are fetched and stored
+   through the identical smart_fetch/write_raw_prices path as FX
+   pairs, just keyed by a macro symbol name (e.g. "DXY") instead of a
+   6-char FX pair, and kept non-fatal in run_data_pipeline so a
+   macro-source hiccup never blocks the core FX fetch.
 """
 
 import yfinance as yf
@@ -90,34 +114,27 @@ def _load_config() -> dict:
 config       = _load_config()
 FETCHER_CFG  = config["fetcher"]
 UNIVERSE_CFG = config["universe"]
+MACRO_CFG    = config["macro"]
 
 BATCH_SIZE       = FETCHER_CFG["batch_size"]
 MAX_WORKERS      = FETCHER_CFG["max_workers"]
 RETRY_ATTEMPTS   = FETCHER_CFG["retry_attempts"]
 RETRY_DELAY      = FETCHER_CFG["retry_delay_seconds"]
-HISTORICAL_DAYS  = FETCHER_CFG["historical_days"]      
+HISTORICAL_DAYS  = FETCHER_CFG["historical_days"]
 INCREMENTAL_DAYS = FETCHER_CFG["incremental_days"]
-FETCH_INTERVAL   = FETCHER_CFG["fetch_interval"]        # "1d" — native daily bars
+FETCH_INTERVAL   = FETCHER_CFG["fetch_interval"]        # "1wk" — native weekly bars
+
+MACRO_DRIVERS    = MACRO_CFG["drivers"]   # {"DXY": {"yf_ticker": ..., "storage_symbol": ...}, ...}
 
 
 # =============================================================================
 # FIXED FX UNIVERSE
-# Unlike the stock project's NASDAQ FTP scrape, the FX universe is a small,
-# fixed list defined directly in config.yaml — no discovery, no filtering
-# funnel. yfinance ticker format for FX is "EURUSD=X" (base+quote+"=X").
 # =============================================================================
 
 def get_full_universe() -> list[str]:
     """
     Return the fixed FX pair universe from config, converted to yfinance
     ticker format.
-
-    FLOW:
-    1. Read `universe.pairs` from config.yaml (28 pairs, e.g. "EURUSD")
-    2. Append yfinance's FX suffix "=X" to each (e.g. "EURUSD=X")
-    3. Return as a stable, ordered list (already deduplicated at config
-       validation time — no set()/sort() reshuffling needed here, unlike
-       the stock project's dynamically-discovered universe)
 
     Returns:
         List of yfinance-format FX tickers, e.g. ["EURUSD=X", "GBPUSD=X", ...]
@@ -131,15 +148,50 @@ def get_full_universe() -> list[str]:
 
 def _strip_yf_suffix(ticker: str) -> str:
     """Convert a yfinance FX ticker back to the plain pair name.
-    'EURUSD=X' -> 'EURUSD'. Used when writing to storage/DB, where we
-    key on the plain pair name (matches config.yaml's `universe.pairs`
-    and `universe.currencies`), not the yfinance-specific suffix.
-    """
+    'EURUSD=X' -> 'EURUSD'."""
     return ticker.replace("=X", "")
 
 
 # =============================================================================
-# SINGLE PAIR OHLC FETCH (Daily)
+# MACRO DRIVER UNIVERSE (DXY, gold, US10Y, WTI, VIX)
+# =============================================================================
+# Fetched and stored through the exact same path as FX pairs — same
+# write_raw_prices/read_price_history calls, just with a "pair name"
+# that's a macro symbol (e.g. "DXY") instead of a 6-char FX pair, and
+# a yfinance ticker that isn't a plain "XXXYYY=X" FX ticker. Added
+# because the EURUSD-only reference project's edge came heavily from
+# these external, non-price-derived drivers — the original basket
+# design had none of them (see engines/macro.py for the feature side).
+
+# yfinance ticker -> the storage_symbol we file it under (reverse of
+# MACRO_DRIVERS, built once at import time).
+_YF_TICKER_TO_STORAGE_SYMBOL = {
+    driver_cfg["yf_ticker"]: driver_cfg["storage_symbol"]
+    for driver_cfg in MACRO_DRIVERS.values()
+}
+
+
+def get_macro_universe() -> list[str]:
+    """
+    Return the macro driver universe's yfinance tickers, e.g.
+    ["DX-Y.NYB", "GC=F", "^TNX", "CL=F", "^VIX"] (deduped — CHF and
+    JPY both map to VIX, so this only fetches it once).
+    """
+    tickers = sorted(set(_YF_TICKER_TO_STORAGE_SYMBOL.keys()))
+    logger.info(f"Macro driver universe loaded from config | {len(tickers)} symbols")
+    return tickers
+
+
+def _macro_storage_symbol(ticker: str) -> str:
+    """Map a macro yfinance ticker back to its storage symbol name.
+    'DX-Y.NYB' -> 'DXY'. Unlike _strip_yf_suffix (FX pairs), macro
+    tickers have irregular yfinance formats (^VIX, GC=F, DX-Y.NYB),
+    so this is a config-driven lookup rather than string slicing."""
+    return _YF_TICKER_TO_STORAGE_SYMBOL[ticker]
+
+
+# =============================================================================
+# SINGLE PAIR OHLC FETCH (Weekly)
 # =============================================================================
 
 @retry(
@@ -152,39 +204,39 @@ def fetch_single_pair(
     start_date : str,
     end_date   : str,
     min_rows   : int = 50,
+    pair_name_resolver = _strip_yf_suffix,
 ) -> Optional[pd.DataFrame]:
     """
-    Fetch Daily OHLC data for a single FX pair via yfinance.
-
-    FLOW:
-    1. Download Daily OHLC from yfinance (no volume — see note below)
-    2. Flatten MultiIndex columns if present
-    3. Standardise column names to lowercase
-    4. Force UTC timezone alignment on the index
-    5. Add pair and datetime columns
-    6. Validate data quality
-    7. Drop nulls and non-positive prices
-    8. Return clean, Daily DataFrame
+    Fetch Weekly OHLC data for a single FX pair (or macro driver) via
+    yfinance.
 
     NOTE ON VOLUME: FX is decentralized (OTC) — there is no real,
-    centralized traded volume the way exchanges provide for stocks. What
-    yfinance reports for FX tickers is synthetic "tick volume" (count of
-    price changes, not actual transaction size). We deliberately do not
-    fetch or keep a volume column at all here — training on tick-volume-
-    as-if-it-were-real-volume would be learning from noise dressed up as
-    signal. This is a hard drop, not an oversight.
+    centralized traded volume the way exchanges provide for stocks. We
+    deliberately do not fetch or keep a volume column at all here.
+    Macro drivers (DXY, gold futures, etc.) DO have real volume, but
+    we drop it here too for schema consistency with the FX side —
+    volume isn't used by any engine in this project.
 
     Args:
-        ticker    : yfinance FX ticker, e.g. "EURUSD=X"
+        ticker    : yfinance ticker, e.g. "EURUSD=X" (FX) or "^VIX" (macro)
         start_date: Start date string YYYY-MM-DD
         end_date  : End date string YYYY-MM-DD
-        min_rows  : Minimum row count to pass validation —
-                    MUST reflect whether this call is part of a full or
-                    incremental fetch.
+        min_rows  : Minimum row count to pass validation — MUST reflect
+                    whether this call is part of a full or incremental
+                    fetch (see validate_dataframe's docstring in
+                    utils/error_handler.py: using the same floor for
+                    both fetch modes silently rejects every legitimate
+                    incremental fetch). Callers (smart_fetch) pass the
+                    correct value per mode.
+        pair_name_resolver: Function mapping the yfinance ticker to
+                    the name stored in the 'pair' column. Defaults to
+                    the FX '=X'-suffix stripper; macro callers pass
+                    _macro_storage_symbol instead so "^VIX" is stored
+                    as "VIX", not the raw ticker string.
 
     Returns:
-        Clean Daily OHLC DataFrame (columns: pair, datetime, open, high,
-        low, close) or None if fetch/validation fails
+        Clean Weekly OHLC DataFrame (columns: pair, datetime, open,
+        high, low, close) or None if fetch/validation fails
     """
     local_session = curl_requests.Session(impersonate="chrome")
 
@@ -193,7 +245,7 @@ def fetch_single_pair(
             ticker,
             start       = start_date,
             end         = end_date,
-            interval    = FETCH_INTERVAL,   
+            interval    = FETCH_INTERVAL,   # "1wk" — native weekly bars, no resampling
             auto_adjust = True,
             progress    = False,
             threads     = False,
@@ -206,14 +258,11 @@ def fetch_single_pair(
             logger.warning(f"{ticker} | yfinance returned empty DataFrame")
             return None
 
-        # Flatten MultiIndex columns if present
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
 
-        # Standardise column names
         raw.columns = [c.lower() for c in raw.columns]
 
-        # Keep only OHLC — no volume column for FX (see docstring note)
         required = ["open", "high", "low", "close"]
         missing  = [c for c in required if c not in raw.columns]
         if missing:
@@ -221,27 +270,26 @@ def fetch_single_pair(
             return None
 
         df = raw[required].copy()
-        
+
         # Force UTC-aware index to standardize datetimes
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
         else:
             df.index = df.index.tz_convert("UTC")
 
-        pair_name = _strip_yf_suffix(ticker)
-        df["pair"]     = pair_name
-        df["datetime"] = df.index
-        df             = df.reset_index(drop=True)
+        pair_name       = pair_name_resolver(ticker)
+        df["pair"]      = pair_name
+        df["datetime"]  = df.index
+        df              = df.reset_index(drop=True)
 
         if not validate_dataframe(df, pair_name, required, min_rows=min_rows):
             return None
 
-        # Drop rows with null OHLC or non-positive close
         df = df.dropna(subset=required)
         df = df[df["close"] > 0]
 
         logger.debug(
-            f"{ticker} | {len(df)} Daily rows | "
+            f"{ticker} | {len(df)} weekly rows | "
             f"{start_date} to {end_date}"
         )
         return df
@@ -259,23 +307,18 @@ def fetch_batch(
     start_date : str,
     end_date   : str,
     min_rows   : int = 50,
+    pair_name_resolver = _strip_yf_suffix,
 ) -> pd.DataFrame:
     """
-    Fetch Daily OHLC data for a batch of pairs in parallel.
-
-    FLOW:
-    1. Submit all pairs to ThreadPoolExecutor simultaneously
-    2. Collect results as they complete
-    3. Log failed pairs
-    4. Combine successful results into single DataFrame
+    Fetch Weekly OHLC data for a batch of pairs in parallel.
 
     Args:
-        tickers   : List of yfinance FX tickers
+        tickers   : List of yfinance tickers (FX or macro)
         start_date: Start date string YYYY-MM-DD
         end_date  : End date string YYYY-MM-DD
-        min_rows  : Passed through to fetch_single_pair's validation —
-                    MUST reflect full vs incremental fetch mode (see
-                    fetch_single_pair's docstring)
+        min_rows  : Passed through to fetch_single_pair's validation
+        pair_name_resolver: Passed through to fetch_single_pair — see
+                    its docstring. Defaults to the FX resolver.
 
     Returns:
         Combined DataFrame for all successful pairs in batch
@@ -285,7 +328,10 @@ def fetch_batch(
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_ticker = {
-            executor.submit(fetch_single_pair, ticker, start_date, end_date, min_rows): ticker
+            executor.submit(
+                fetch_single_pair, ticker, start_date, end_date, min_rows,
+                pair_name_resolver,
+            ): ticker
             for ticker in tickers
         }
 
@@ -320,30 +366,20 @@ def fetch_universe(
     start_date : str,
     end_date   : str,
     min_rows   : int = 50,
+    pair_name_resolver = _strip_yf_suffix,
 ) -> pd.DataFrame:
     """
-    Fetch Daily OHLC data for the entire FX universe in batches.
-
-    FLOW:
-    1. Split full ticker list into batches of BATCH_SIZE
-       (with only 28 pairs total, this is typically a single batch —
-       kept batched for consistency with the stock project and to scale
-       gracefully if the universe list grows)
-    2. Process each batch sequentially
-       (parallelism happens WITHIN each batch via ThreadPoolExecutor)
-    3. Combine all batch results
-    4. Log summary statistics
+    Fetch Weekly OHLC data for the entire FX universe (or macro driver
+    set) in batches.
 
     Args:
-        tickers   : Full list of yfinance FX tickers
+        tickers   : Full list of yfinance tickers (FX or macro)
         start_date: Start date YYYY-MM-DD
         end_date  : End date YYYY-MM-DD
-        min_rows  : Passed through to fetch_batch/fetch_single_pair's
-                    validation — MUST reflect full vs incremental fetch
-                    mode (see fetch_single_pair's docstring). smart_fetch
-                    is the only caller that should decide this value;
-                    it calls fetch_universe once per mode with the
-                    correct min_rows each time.
+        min_rows  : Passed through to fetch_batch/fetch_single_pair
+        pair_name_resolver: Passed through to fetch_batch — see
+                    fetch_single_pair's docstring. Defaults to the FX
+                    resolver.
 
     Returns:
         Combined DataFrame for all pairs
@@ -356,21 +392,19 @@ def fetch_universe(
     all_data = []
 
     logger.info(
-        f"Fetching {total} FX pairs | "
+        f"Fetching {total} symbols | "
         f"{len(batches)} batch(es) of up to {BATCH_SIZE} | "
         f"Period: {start_date} to {end_date} | "
-        f"Interval: {FETCH_INTERVAL} | "
-        f"min_rows: {min_rows}"
+        f"Interval: {FETCH_INTERVAL} | min_rows: {min_rows}"
     )
 
     for i, batch in enumerate(batches, 1):
-        logger.info(f"Batch {i}/{len(batches)} | {len(batch)} pairs")
-        batch_df = fetch_batch(batch, start_date, end_date, min_rows)
+        logger.info(f"Batch {i}/{len(batches)} | {len(batch)} symbols")
+        batch_df = fetch_batch(batch, start_date, end_date, min_rows, pair_name_resolver)
 
         if not batch_df.empty:
             all_data.append(batch_df)
 
-        # Pause between batches to avoid Yahoo Finance rate limiting
         if i < len(batches):
             _time.sleep(3)
 
@@ -381,7 +415,7 @@ def fetch_universe(
     combined = pd.concat(all_data, ignore_index=True)
     logger.info(
         f"fetch_universe complete | "
-        f"Total Daily rows: {len(combined)} | "
+        f"Total weekly rows: {len(combined)} | "
         f"Pairs with data: {combined['pair'].nunique()}"
     )
     return combined
@@ -391,30 +425,20 @@ def fetch_universe(
 # SMART FETCH — full vs incremental per pair
 # =============================================================================
 
-def smart_fetch(tickers: list[str]) -> pd.DataFrame:
+def smart_fetch(
+    tickers: list[str],
+    pair_name_resolver = _strip_yf_suffix,
+) -> pd.DataFrame:
     """
     Intelligently decide full vs incremental fetch per pair, in both
     local (SQLite) and cloud (Supabase) modes.
 
-    DECISION LOGIC per pair:
-    - Not previously tracked → full HISTORICAL_DAYS fetch
-    - Already tracked        → incremental INCREMENTAL_DAYS fetch (buffer
-      window covering weekend gaps and any missed pipeline runs)
-
-    This means:
-    - First ever run: downloads massive multi-year historical data.
-    - All subsequent runs: only fetch INCREMENTAL_DAYS of daily data per pair.
-
-    Cloud mode tracks last-fetched date per pair via a small Postgres
-    table (fetch_tracker), same pattern as the stock project — one bulk
-    query for the whole universe, not one query per pair.
-
-    NOTE: last-fetch tracking here is keyed on plain pair name (e.g.
-    "EURUSD"), matching what fetch_single_pair writes to the `pair`
-    column — not the yfinance "=X" ticker format.
-
     Args:
-        tickers: Full universe ticker list (yfinance format, e.g. "EURUSD=X")
+        tickers: yfinance tickers to fetch (FX pairs or macro drivers)
+        pair_name_resolver: Maps each ticker to its stored 'pair' name.
+                    Defaults to the FX '=X'-suffix stripper; macro
+                    callers (smart_fetch_macro) pass
+                    _macro_storage_symbol instead.
 
     Returns:
         Combined DataFrame of all new data fetched
@@ -425,15 +449,13 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
     full_tickers        = []
     incremental_tickers = []
 
-    # ── Determine each pair's last-fetched date ────────────────────────────
     if _is_cloud:
-        # ONE bulk query for the whole universe, not one query per pair
         last_fetch_map = get_last_fetch_dates_bulk()
     else:
-        last_fetch_map = None  # local path looks up per-pair via SQLite below
+        last_fetch_map = None
 
     for ticker in tickers:
-        pair_name = _strip_yf_suffix(ticker)
+        pair_name = pair_name_resolver(ticker)
 
         if _is_cloud:
             last_date = last_fetch_map.get(pair_name)
@@ -447,13 +469,12 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
 
     logger.info(
         f"smart_fetch | Cloud mode: {_is_cloud} | "
-        f"Full fetch needed: {len(full_tickers)} pairs | "
-        f"Incremental: {len(incremental_tickers)} pairs"
+        f"Full fetch needed: {len(full_tickers)} symbols | "
+        f"Incremental: {len(incremental_tickers)} symbols"
     )
 
     all_data = []
 
-    # ── Full historical fetch ───────────────────────────────────────────────
     FULL_FETCH_MIN_ROWS = 50
 
     if full_tickers:
@@ -462,12 +483,15 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
         ).strftime("%Y-%m-%d")
 
         logger.info(f"Full fetch: {start_full} to {end_date}")
-        df_full = fetch_universe(full_tickers, start_full, end_date, min_rows=FULL_FETCH_MIN_ROWS)
+        df_full = fetch_universe(
+            full_tickers, start_full, end_date,
+            min_rows=FULL_FETCH_MIN_ROWS,
+            pair_name_resolver=pair_name_resolver,
+        )
 
         if not df_full.empty:
             all_data.append(df_full)
 
-    # ── Incremental fetch ────────────────────────────────────────────────────
     INCREMENTAL_FETCH_MIN_ROWS = 1
 
     if incremental_tickers:
@@ -476,7 +500,11 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
         ).strftime("%Y-%m-%d")
 
         logger.info(f"Incremental fetch: {start_incr} to {end_date}")
-        df_incr = fetch_universe(incremental_tickers, start_incr, end_date, min_rows=INCREMENTAL_FETCH_MIN_ROWS)
+        df_incr = fetch_universe(
+            incremental_tickers, start_incr, end_date,
+            min_rows=INCREMENTAL_FETCH_MIN_ROWS,
+            pair_name_resolver=pair_name_resolver,
+        )
 
         if not df_incr.empty:
             all_data.append(df_incr)
@@ -487,7 +515,6 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
 
     combined = pd.concat(all_data, ignore_index=True)
 
-    # ── Update the fetch tracker with what was ACTUALLY fetched ────────────
     if _is_cloud and not combined.empty:
         max_dates = (
             combined.groupby("pair")["datetime"]
@@ -497,46 +524,34 @@ def smart_fetch(tickers: list[str]) -> pd.DataFrame:
         )
         write_last_fetch_dates(max_dates)
 
-    logger.info(f"smart_fetch complete | Total Daily rows: {len(combined)}")
+    logger.info(f"smart_fetch complete | Total weekly rows: {len(combined)}")
     return combined
+
+
+def smart_fetch_macro() -> pd.DataFrame:
+    """
+    Fetch all configured macro drivers (DXY, gold, US10Y, WTI, VIX),
+    full-vs-incremental, through the exact same smart_fetch path as FX
+    pairs — just with the macro ticker list and the macro pair-name
+    resolver swapped in. Storage is identical (write_raw_prices), so
+    downstream engines/features.py reads macro history the same way
+    it reads any FX pair's history.
+    """
+    macro_tickers = get_macro_universe()
+    return smart_fetch(macro_tickers, pair_name_resolver=_macro_storage_symbol)
 
 
 # =============================================================================
 # SHAPE ADAPTER — long-form fetch output -> per-pair dict for engines
-# Every engine (linreg, smc, adx, csi) takes tickers_data as
-# dict[pair_name -> DataFrame], matching the stock project's convention.
-# fetch_universe()/smart_fetch() return a single long-form DataFrame
-# (all pairs stacked, via pd.concat) — this is the same shape the
-# original stock fetcher.py produced, and reshaping it into per-ticker
-# dicts was always something the orchestrator did upstream of the
-# engines, not fetcher.py itself. Added here as a small, clearly-scoped
-# utility so that piece of glue code exists in one obvious place rather
-# than being silently assumed or re-implemented ad hoc later.
 # =============================================================================
 
 def to_pair_dict(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """
-    Convert a long-form OHLC DataFrame (all pairs stacked, one 'pair'
-    column) into the dict[pair_name -> DataFrame] shape every engine
-    (linreg, smc, adx, csi) expects as its `tickers_data` argument.
-
-    FLOW:
-    1. Group by 'pair'
-    2. For each pair, sort its rows by datetime ascending (engines
-       assume chronological order — e.g. LinReg/ADX read the last N
-       rows as "most recent")
-    3. Drop the now-redundant 'pair' column from each per-pair frame
-       (it's already the dict key)
-    4. Return the dict, ready to pass straight into run_csi_engine,
-       run_linreg_engine, etc.
-
-    Args:
-        df: Long-form DataFrame with columns including 'pair' and
-            'datetime', as produced by fetch_universe()/smart_fetch()
+    Convert a long-form OHLC DataFrame into dict[pair_name -> DataFrame].
 
     Returns:
-        Dict mapping pair name (e.g. 'EURUSD') -> that pair's OHLC
-        DataFrame, sorted datetime ascending, 'pair' column dropped
+        Dict mapping pair name -> that pair's OHLC DataFrame, sorted
+        datetime ascending, 'pair' column dropped
     """
     if df.empty:
         logger.warning("to_pair_dict: input DataFrame is empty, returning {}")
@@ -544,8 +559,7 @@ def to_pair_dict(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
     if "pair" not in df.columns:
         raise DataValidationError(
-            "to_pair_dict: input DataFrame has no 'pair' column — "
-            "expected long-form output from fetch_universe()/smart_fetch()"
+            "to_pair_dict: input DataFrame has no 'pair' column"
         )
 
     pair_dict = {}
@@ -562,23 +576,11 @@ def to_pair_dict(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 # =============================================================================
 # MAIN PIPELINE ENTRY POINT
-# Called by the scheduler (see config `scheduler` section — cadence still
-# open per the build-order discussion: once daily vs. every H4 close).
 # =============================================================================
 
 def run_data_pipeline() -> dict:
     """
     Main entry point for the FX data pipeline.
-
-    FULL FLOW:
-    1. Load fixed 28-pair universe from config
-    2. Smart fetch OHLC data (full or incremental per pair), fetching Daily
-       data directly.
-    3. Write raw (Daily) prices to storage
-
-    Unlike the stock project, there is no Stage 1 filter step and no
-    sector metadata fetch — both are structurally absent for FX, not
-    skipped conditionally. See module docstring.
 
     Returns:
         Summary dict with counts for scheduler logging and monitoring
@@ -590,11 +592,9 @@ def run_data_pipeline() -> dict:
     summary = {}
 
     try:
-        # ── Step 1: Get fixed universe ──────────────────────────────────────
         tickers                  = get_full_universe()
         summary["universe_size"] = len(tickers)
 
-        # ── Step 2: Smart fetch Daily OHLC ──────────────────────────────────
         df                      = smart_fetch(tickers)
         summary["rows_fetched"] = len(df)
 
@@ -602,9 +602,26 @@ def run_data_pipeline() -> dict:
             logger.error("Data pipeline: No data fetched. Aborting.")
             return summary
 
-        # ── Step 3: Write raw prices ─────────────────────────────────────────
         rows_written            = write_raw_prices(df)
         summary["rows_written"] = rows_written
+
+        # Macro drivers (DXY, gold, US10Y, WTI, VIX) — fetched and
+        # stored through the same write_raw_prices path, but kept
+        # non-fatal: a macro-source hiccup (e.g. yfinance rate-limits
+        # ^VIX) should never block writing the FX prices the rest of
+        # the pipeline depends on.
+        try:
+            macro_df = smart_fetch_macro()
+            summary["macro_rows_fetched"] = len(macro_df)
+
+            if not macro_df.empty:
+                macro_rows_written = write_raw_prices(macro_df)
+                summary["macro_rows_written"] = macro_rows_written
+            else:
+                logger.warning("Macro fetch returned no data this run")
+        except Exception as e:
+            logger.error(f"Macro fetch failed (non-fatal, FX data still written): {e}", exc_info=True)
+            summary["macro_fetch_error"] = str(e)
 
         logger.info("=" * 60)
         logger.info(f"FX DATA PIPELINE COMPLETE | Summary: {summary}")
@@ -615,4 +632,3 @@ def run_data_pipeline() -> dict:
     except Exception as e:
         logger.critical(f"FX data pipeline failed: {e}", exc_info=True)
         raise
-

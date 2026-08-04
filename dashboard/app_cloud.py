@@ -46,12 +46,54 @@ WHAT'S DROPPED FROM THE STOCK PROJECT'S DASHBOARD:
 
 WHAT'S RENAMED:
    - ticker -> pair, throughout
-   - sector -> currency_bloc (screener.py's display-only bloc label,
-     e.g. "EUR/USD" or "AUD/USD (Commodity)")
-   - "date" -> "datetime" for the last-scan caption, since this project
-     scans twice daily (config.yaml's scheduler.run_times), not once —
-     a date alone doesn't tell you which of the day's two runs you're
-     looking at.
+   - "date" -> "datetime" for the last-run caption
+
+WHAT CHANGED IN THIS PASS — SECTION 2 IS A REDESIGN, NOT A RENAME:
+   The project moved from a scanner-flagged-candidate design (LinReg +
+   SMC + a slope/SD-zone gate, one Signal Ranker scoring pre-chosen
+   long/short candidates) to an unconditional, basket-grouped
+   directional-prediction design (no scanner, no candidates — every
+   pair in every basket gets an up/down probability every run, and
+   only predictions clearing the project's display threshold — e.g.
+   >=70% confidence — are ever written to Supabase at all; see
+   run_pipeline_cloud.py's STEP 9.5 and data/database_cloud.py's
+   module docstring for where that filtering happens). Concretely:
+     - read_latest_scan_results (direction="long"/"short") is GONE —
+       replaced by read_latest_prediction_results(basket=...), which
+       reads the NEW prediction_results table
+     - "Scanner Results" (Long/Short candidate tabs) is replaced by
+       "Predictions" — one section per basket, since each basket has
+       its own independently-trained model, showing pair/direction/
+       confidence rather than pair/currency_bloc/sd_position/ml_score
+     - ml_rank (a per-candidate rank) is gone — replaced by sorting on
+       confidence, since there's no candidate-ranking concept anymore
+     - currency_bloc, sd_position, has_valid_zone, ml_score — all
+       LinReg/SMC/scanner-era fields — are gone; predictions now show
+       pair, direction, up_probability, confidence
+   Section 1 (Currency Strength) and Section 3 (Model Health) needed
+   NO structural changes — CSI's per-currency z-score gauges and the
+   model-metrics table were never scanner/candidate-dependent.
+
+WHAT CHANGED IN THIS PASS — DAILY TIMEFRAME, LATEST-CANDLE CAPTION:
+   The project moved from Weekly to Daily bars (config.yaml's
+   fetcher.fetch_interval), and label_forward_periods now means "2
+   business days ahead," not "2 weekly candles ahead." The header
+   caption previously showed indicator_results' latest datetime as a
+   generic "Last run" timestamp — this was misleading twice over: (1)
+   it's a scan-completion time, not the underlying candle's date, and
+   (2) "last run" invites the reader to wonder how stale the run is,
+   when what actually matters for trading is how stale the PRICE DATA
+   is and whether the prediction it produced has already expired. The
+   caption now reads the fetch_tracker table directly (via
+   data.database_cloud.get_last_fetch_dates_bulk(), already used
+   elsewhere in this project for the same table) and shows the actual
+   latest fetched candle date plus its computed validity window (candle
+   date + 2 business days, matching label_forward_periods=2 on daily
+   bars) — e.g. "Latest candle: 2026-07-29 — valid through 2026-07-31
+   (expires 2026-08-01)". If different pairs somehow show different
+   last_fetch_date values (a partial fetch failure), the caption shows
+   the OLDEST one and warns, rather than silently reporting the newest
+   and hiding that some pairs are stale.
 """
 
 import os
@@ -69,8 +111,8 @@ import plotly.graph_objects as go
 # throws StreamlitAPIException and masks the real secrets error underneath.
 # =============================================================================
 
-SYSTEM_NAME = "FX Scanner"
-SYSTEM_ICON = "💱"
+SYSTEM_NAME = "Eagle Logic FX System"
+SYSTEM_ICON = "🦅"
 
 st.set_page_config(
     page_title = SYSTEM_NAME,
@@ -94,8 +136,10 @@ elif "SUPABASE_DB_URL" not in os.environ:
 from data.database_cloud import (
     initialise_database,
     read_latest_indicator_results,
-    read_latest_scan_results,
+    read_latest_prediction_results,
     read_latest_model_metrics,
+    get_last_fetch_dates_bulk,
+    read_prediction_outcomes,
 )
 
 # ── Initialise DB tables (safe — IF NOT EXISTS) ───────────────────────────────
@@ -119,7 +163,8 @@ with header_col2:
     )
     st.markdown(
         "<p style='color:#9ca3af;margin-top:0;'>"
-        "LinReg Channel + Smart Money Concepts + Currency Strength Scanner — 4H"
+        "Basket-Grouped Directional Predictions — ADX + Currency Strength + "
+        "Bollinger + Momentum"
         "</p>",
         unsafe_allow_html=True,
     )
@@ -131,12 +176,81 @@ if indicator_df.empty:
     st.warning("No scan data yet. Pipeline has not run or Supabase is empty.")
     st.stop()
 
-latest_datetime = indicator_df["datetime"].max()
-st.caption(
-    f"Last scan: {latest_datetime} UTC — "
-    f"prices may have moved since scan time. Scans run twice daily "
-    f"(12:00 and 20:00 UTC)."
-)
+# ── Latest candle date + validity window ──────────────────────────────────
+# Replaces the old "Last run: <indicator_results timestamp> UTC" caption.
+# That showed when the SCAN completed, not when the underlying PRICE
+# DATA is actually from — misleading for judging whether a prediction
+# is still actionable. This reads fetch_tracker directly (the same
+# table/function data/fetcher.py itself writes to and reads from) to
+# show the real latest candle date, plus how long that candle's
+# prediction remains valid (label_forward_periods business days ahead
+# on daily bars — see config.yaml's ml.label_forward_periods).
+import datetime as _datetime
+
+def _add_business_days(start_date: _datetime.date, n: int) -> _datetime.date:
+    """Add n business days (Mon-Fri) to start_date, skipping weekends —
+    matches FX market closure, consistent with how label_direction()
+    itself must skip non-trading days when building the 2-day-ahead
+    label this validity window is meant to mirror."""
+    current = start_date
+    added   = 0
+    while added < n:
+        current += _datetime.timedelta(days=1)
+        if current.weekday() < 5:  # Mon=0 ... Fri=4
+            added += 1
+    return current
+
+LABEL_FORWARD_PERIODS = 2  # matches config.yaml's ml.label_forward_periods
+                            # (daily bars: "2 business days ahead")
+
+fetch_dates = get_last_fetch_dates_bulk()  # {pair: "YYYY-MM-DD"}
+
+if not fetch_dates:
+    st.caption("Latest candle date unavailable — fetch_tracker is empty.")
+else:
+    parsed_dates = {
+        pair: _datetime.date.fromisoformat(date_str)
+        for pair, date_str in fetch_dates.items()
+    }
+    oldest_date  = min(parsed_dates.values())
+    newest_date  = max(parsed_dates.values())
+
+    # valid_through = the Nth business day itself (the last day the
+    # prediction still covers). expires_on = the calendar day
+    # immediately after valid_through (the exclusive boundary — once
+    # this date arrives, a fresh candle/prediction should exist and
+    # the old one should no longer be acted on).
+    valid_through = _add_business_days(oldest_date, LABEL_FORWARD_PERIODS)
+    expires_on    = valid_through + _datetime.timedelta(days=1)
+
+    if oldest_date == newest_date:
+        st.caption(
+            f"📅 Latest candle: **{oldest_date.isoformat()}** — "
+            f"valid through **{valid_through.isoformat()}** "
+            f"(expires {expires_on.isoformat()}). "
+            f"Predicts {LABEL_FORWARD_PERIODS} business days ahead."
+        )
+    else:
+        # Pairs disagree on last_fetch_date — a partial fetch failure
+        # somewhere. Show the OLDEST (most conservative/limiting) date
+        # as the basis for validity, and warn explicitly rather than
+        # silently reporting the newest and hiding that some pairs are
+        # running on stale data.
+        stale_pairs = [p for p, d in parsed_dates.items() if d == oldest_date]
+        st.caption(
+            f"📅 Latest candle: **{oldest_date.isoformat()}** to "
+            f"**{newest_date.isoformat()}** (pairs disagree — "
+            f"{len(stale_pairs)} pair(s) on the oldest date) — "
+            f"valid through **{valid_through.isoformat()}** "
+            f"(expires {expires_on.isoformat()}), based on the OLDEST "
+            f"fetched pair. Predicts {LABEL_FORWARD_PERIODS} business "
+            f"days ahead."
+        )
+        st.warning(
+            f"⚠️ {len(stale_pairs)} pair(s) have an older last_fetch_date "
+            f"than the rest — their predictions may be based on stale "
+            f"data: {', '.join(sorted(stale_pairs))}"
+        )
 
 BADGE = {"bullish": "🟢", "bearish": "🔴", "broken": "🟡", "unknown": "⚪"}
 
@@ -235,45 +349,158 @@ if not commodity_bloc_rows.empty:
 
 
 # =============================================================================
-# SECTION 2 — SCANNER RESULTS
+# SECTION 2 — PREDICTIONS (replaces Scanner Results — see module docstring)
+# One tab per basket (config.yaml's universe.baskets, read dynamically
+# so this file doesn't need editing whenever baskets are added/renamed).
+# Each basket's model is independent, so predictions are shown grouped
+# by basket rather than by long/short direction — direction is now a
+# COLUMN within each basket's table, not a separate tab, since a single
+# basket's predictions can be a mix of "up" and "down" calls.
 # =============================================================================
 
-st.header("Scanner Results")
+st.header("Predictions")
+st.caption(
+    "Only predictions clearing the display confidence threshold are "
+    "shown — see config.yaml's ml.high_probability_threshold. Each "
+    "basket has its own independently-trained model."
+)
 
-tab_long, tab_short = st.tabs(["📗 Long Candidates", "📕 Short Candidates"])
+import yaml as _yaml
 
-cols_to_show = [
-    "ml_rank", "pair", "currency_bloc", "sd_position",
-    "has_valid_zone", "ml_score",
-]
+def _load_baskets() -> dict:
+    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
+    with open(config_path, "r") as f:
+        cfg = _yaml.safe_load(f)
+    return cfg.get("universe", {}).get("baskets", {})
 
-with tab_long:
-    longs = read_latest_scan_results(direction="long")
-    if longs.empty:
-        st.info("No long candidates this run.")
-    else:
-        display_cols = [c for c in cols_to_show if c in longs.columns]
-        st.dataframe(
-            longs[display_cols].style.background_gradient(
-                subset=["ml_score"], cmap="Greens"
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+BASKETS = _load_baskets()
 
-with tab_short:
-    shorts = read_latest_scan_results(direction="short")
-    if shorts.empty:
-        st.info("No short candidates this run.")
-    else:
-        display_cols = [c for c in cols_to_show if c in shorts.columns]
-        st.dataframe(
-            shorts[display_cols].style.background_gradient(
-                subset=["ml_score"], cmap="Reds"
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+if not BASKETS:
+    st.warning(
+        "No baskets configured in config.yaml's universe.baskets — "
+        "cannot show per-basket predictions."
+    )
+else:
+    basket_tabs = st.tabs([f"📊 {name}" for name in BASKETS.keys()])
+
+    cols_to_show = ["pair", "direction", "up_probability", "confidence", "signal_status", "previous_probability"]
+
+    for tab, basket_name in zip(basket_tabs, BASKETS.keys()):
+        with tab:
+            basket_predictions = read_latest_prediction_results(basket=basket_name)
+
+            if basket_predictions.empty:
+                st.info(
+                    f"No predictions cleared the display threshold for "
+                    f"{basket_name} this run."
+                )
+                continue
+
+            display_cols = [c for c in cols_to_show if c in basket_predictions.columns]
+
+            # Human-readable signal_status + previous_probability combo,
+            # e.g. "Continuation (was up @ 0.60)" or "Flip (was down @
+            # 0.30)" — folds two raw columns into one readable string
+            # rather than showing them as separate numeric/text columns.
+            if "signal_status" in basket_predictions.columns and "previous_probability" in basket_predictions.columns:
+                def _format_signal_status(row):
+                    status = row.get("signal_status")
+                    prev_p = row.get("previous_probability")
+                    if status == "first signal" or pd.isna(prev_p):
+                        return "First signal"
+                    label = "Continuation" if status == "continuation" else "Flip"
+                    return f"{label} (was {row['direction'] if status == 'continuation' else ('down' if row['direction']=='up' else 'up')} @ {prev_p:.2f})"
+
+                basket_predictions["Signal"] = basket_predictions.apply(_format_signal_status, axis=1)
+                display_cols = [c for c in display_cols if c not in ("signal_status", "previous_probability")] + ["Signal"]
+
+            # Colour by direction: green background for "up" rows, red
+            # for "down" — background_gradient alone (as the old
+            # ml_score-based version used) doesn't make sense here since
+            # up/down calls need visually distinct treatment, not just a
+            # single-direction intensity gradient.
+            def _highlight_direction(row):
+                color = "#14532d" if row.get("direction") == "up" else "#7f1d1d"
+                return [f"background-color: {color}"] * len(row)
+
+            st.dataframe(
+                basket_predictions[display_cols].style.apply(_highlight_direction, axis=1),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+# =============================================================================
+# SECTION 2.5 — LIVE TRACKING
+# =============================================================================
+# Tracks REAL, ongoing prediction accuracy — separate from the
+# original backtest's AUC/precision, which only ever measured
+# historical held-out data. Once a prediction's validity window has
+# elapsed (see run_pipeline_cloud.py's STEP 8.5), the pipeline scores
+# it against the actual price move and records the outcome here. This
+# is the honest, ongoing answer to "is the deployed model actually
+# performing the way the backtest suggested it would" — the backtest
+# is a one-time historical estimate; this is live evidence that
+# accumulates over time.
+
+st.header("Live Tracking")
+st.caption(
+    "Real outcomes for expired predictions — was the direction call "
+    "actually correct? This tracks live performance separately from "
+    "the original backtest metrics shown under Model Health below."
+)
+
+outcomes_df = read_prediction_outcomes(limit_days=30)
+
+if outcomes_df.empty:
+    st.info(
+        "No scored outcomes yet — predictions are scored once their "
+        "validity window elapses (2 business days after the "
+        "prediction's candle date)."
+    )
+else:
+    # Rolling accuracy summary per basket — the headline number to
+    # compare against each basket's backtest AUC/precision over time.
+    summary = (
+        outcomes_df.groupby("basket")["outcome"]
+        .apply(lambda s: (s == "correct").mean())
+        .reset_index()
+        .rename(columns={"outcome": "accuracy"})
+    )
+    summary["n_predictions"] = outcomes_df.groupby("basket").size().values
+
+    summary_cols = st.columns(len(summary)) if len(summary) > 0 else []
+    for col, (_, row) in zip(summary_cols, summary.iterrows()):
+        with col:
+            st.metric(
+                row["basket"],
+                f"{row['accuracy']:.1%}",
+                help=f"{int(row['n_predictions'])} predictions scored in the last 30 days",
+            )
+
+    st.divider()
+
+    # Detailed outcome table — most recent first.
+    display_outcomes = outcomes_df.copy()
+    display_outcomes["prediction_datetime"] = pd.to_datetime(
+        display_outcomes["prediction_datetime"]
+    ).dt.date
+
+    outcome_cols = [
+        "pair", "basket", "prediction_datetime", "direction",
+        "up_probability", "valid_through_date", "actual_close_change", "outcome",
+    ]
+    outcome_cols = [c for c in outcome_cols if c in display_outcomes.columns]
+
+    def _highlight_outcome(row):
+        color = "#14532d" if row.get("outcome") == "correct" else "#7f1d1d"
+        return [f"background-color: {color}"] * len(row)
+
+    st.dataframe(
+        display_outcomes[outcome_cols].style.apply(_highlight_outcome, axis=1),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # =============================================================================
@@ -287,19 +514,44 @@ metrics = read_latest_model_metrics()
 if metrics.empty:
     st.info("ML models not trained yet.")
 else:
-    mcols = st.columns(2)
-    for i, row in metrics.iterrows():
-        with mcols[i % 2]:
-            st.subheader(row["model_name"])
-            st.metric("Precision", f"{row['precision_score']:.2%}")
-            st.metric("AUC-ROC",   f"{row['auc_roc_score']:.3f}")
+    # Table form, one row per basket model — replaces the previous
+    # per-model st.metric() card grid, which took much more vertical
+    # space to show the same numbers and made cross-basket comparison
+    # (e.g. "which basket has the best AUC-ROC?") harder than a plain
+    # table with sortable columns.
+    display_cols = {
+        "model_name"     : "Model",
+        "precision_score": "Precision",
+        "auc_roc_score"  : "AUC-ROC",
+        "recall_score"   : "Recall",
+        "pr_auc_score"   : "PR-AUC",
+        "train_date"     : "Trained",
+        "n_samples"      : "Samples",
+    }
+    # Only include columns that actually exist in this deployment's
+    # model_metrics table — recall_score/pr_auc_score weren't always
+    # populated for every model run historically.
+    available_cols = [c for c in display_cols if c in metrics.columns]
 
-            if "recall_score" in row and pd.notna(row.get("recall_score")):
-                st.metric("Recall", f"{row['recall_score']:.2%}")
-            if "pr_auc_score" in row and pd.notna(row.get("pr_auc_score")):
-                st.metric("PR-AUC", f"{row['pr_auc_score']:.3f}")
+    health_table = metrics[available_cols].rename(columns=display_cols)
 
-            st.caption(
-                f"Trained: {row['train_date']} | "
-                f"Samples: {row['n_samples']}"
-            )
+    # Format percentage-style columns as readable strings; leave
+    # numeric AUC/PR-AUC as plain floats (already 0-1 scale, not a %).
+    if "Precision" in health_table.columns:
+        health_table["Precision"] = health_table["Precision"].map(
+            lambda v: f"{v:.2%}" if pd.notna(v) else "—"
+        )
+    if "Recall" in health_table.columns:
+        health_table["Recall"] = health_table["Recall"].map(
+            lambda v: f"{v:.2%}" if pd.notna(v) else "—"
+        )
+    if "AUC-ROC" in health_table.columns:
+        health_table["AUC-ROC"] = health_table["AUC-ROC"].map(
+            lambda v: f"{v:.3f}" if pd.notna(v) else "—"
+        )
+    if "PR-AUC" in health_table.columns:
+        health_table["PR-AUC"] = health_table["PR-AUC"].map(
+            lambda v: f"{v:.3f}" if pd.notna(v) else "—"
+        )
+
+    st.dataframe(health_table, hide_index=True, use_container_width=True)

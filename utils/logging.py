@@ -201,6 +201,9 @@ def get_logger(module_name: str, log_file: Optional[str] = None) -> logging.Logg
 #   - get_candlestick_logger — engines/candlestick.py (Hammer/Shooting
 #     Star-at-extreme interaction feature)
 #   - get_pipeline_logger — run_pipeline_cloud.py (the FX orchestrator)
+#   - get_macro_logger — engines/macro.py (external macro drivers:
+#     DXY/gold/US10Y/WTI/VIX per basket, added alongside the basket
+#     feature-engineering redesign)
 # =============================================================================
 
 def get_fetcher_logger()   -> logging.Logger:
@@ -223,6 +226,9 @@ def get_csi_logger()       -> logging.Logger:
 
 def get_candlestick_logger() -> logging.Logger:
     return get_logger("candlestick_engine", "engines.log")
+
+def get_macro_logger()     -> logging.Logger:
+    return get_logger("macro_engine",  "engines.log")
 
 def get_scanner_logger()   -> logging.Logger:
     return get_logger("scanner",       "scanner.log")

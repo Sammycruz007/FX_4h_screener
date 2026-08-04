@@ -1,65 +1,64 @@
 """
 ml/signal_ranker.py
 --------------------
-Signal Ranker ML model for the FX Scanner pipeline.
+Directional model training and inference for the FX basket models.
 
-LOGICAL FLOW:
-─────────────
-This model takes every FX pair that passed the scanner's relaxed
-candidate check and assigns it a probability score: how likely is
-this setup to succeed (price CLOSING at or beyond the fixed LinReg
-mean within FORWARD_PERIODS 4H-candles)?
+WHAT'S DIFFERENT FROM THE PRIOR SIGNAL RANKER VERSION — THIS IS A
+COMPLETE REDESIGN, NOT AN INCREMENTAL CHANGE:
 
-It is the final ranking layer before the dashboard display.
+1. FIVE MODELS, ONE FUNCTION. train_signal_ranker() (one model, all 28
+   pairs pooled) is replaced by train_directional_model(feature_matrix,
+   basket_name), called once per basket from ml/train_models.py's loop.
+   Each basket's model is saved under its own filename
+   (models/directional_{basket_name}.pkl), not one shared
+   signal_ranker.pkl.
 
-THIS IS THE ONLY MODEL IN THE FX PROJECT:
-   Unlike the stock project (Volume Classifier + Signal Ranker,
-   two-stage pipeline), FX has no real volume data (decentralized OTC
-   market — see fetcher.py's docstring) and therefore no Volume
-   Classifier to train or to feed a vol_clf_score into this model.
-   This is a structural simplification, not an oversight — see
-   ml/features.py and ml/labeller.py's module docstrings for the same
-   reasoning applied consistently across the FX rework.
+2. CROSS-PAIR TIME-SERIES LEAKAGE FIX (the reason this file needed a
+   real rework, not just a rename) — flagged directly by the user:
 
-TRAINING FLOW:
-1. Load labelled scan hits from labeller.label_scanner_hits()
-2. Build full feature matrix from features.build_signal_feature_matrix()
-   (includes CSI relative-strength, ATR-normalized distances, ATR
-   ratio, session flags, candlestick-at-extreme interaction, ADX —
-   no volume, no sector RS, no Market Pulse)
-3. Handle class imbalance
-4. Train XGBoost with walk-forward cross-validation
-5. Evaluate (Precision + AUC-ROC + PR-AUC)
-6. Save model to disk
-7. Write metrics to SQLite / Supabase
+       "Suppose Week 120 appears in training for EURUSD. Week 120 for
+       GBPUSD is almost the same macro event. If Week 120 for GBPUSD
+       lands in your validation fold while Week 120 for EURUSD is in
+       training, your model has effectively seen the same market
+       regime... every pair from a given week should belong entirely
+       to either the training set or the validation/test set."
 
-INFERENCE FLOW (per scan run):
-1. Scanner returns N candidates (pairs meeting the relaxed
-   slope + SD-zone conditions — see train_models.py)
-2. For each candidate, compute full feature vector (CSI looked up
-   from a pre-computed universe-wide snapshot, not recomputed per pair
-   — CSI is inherently cross-pair, see engines/csi.py)
-3. Run predict_proba() -> probability of success
-4. Sort candidates by probability descending, within each direction
-5. Assign ml_rank (1 = highest probability)
-6. Write ranked results to storage
-7. Dashboard reads and displays
+   The prior version's train/test split cut at a ROW-COUNT percentile
+   (`int(len(dates) * 0.70)`) on a DataFrame with multiple pairs'
+   rows STACKED together and merely sorted by datetime. Because
+   different pairs don't necessarily produce rows in perfect lockstep,
+   a row-count cutoff does NOT guarantee every pair's row for a given
+   calendar week lands on the same side of the boundary. FIX: split on
+   the UNIQUE SORTED DATETIME VALUES first, not row position. See
+   _split_by_datetime_boundary() below, and its dedicated test
+   asserting zero datetime overlap between train and test across ALL
+   pairs simultaneously.
 
-COLUMN NAMING (pair/datetime, not ticker/date):
-   Consistent with every other FX file — 'pair' and 'datetime'
-   throughout, matching fetcher.py's actual output shape.
+3. MULTI-THRESHOLD EVALUATION, NOT ONE HARDCODED CUTOFF. The prior
+   version evaluated Precision/Recall/F1 at a single hardcoded
+   threshold. In BOTH real training runs performed on this project,
+   that produced misleading results. Fixed here by reporting
+   Precision/Recall/n at SEVERAL thresholds plus AUC-ROC/PR-AUC
+   (threshold-independent).
 
-WHAT'S DROPPED FROM THE STOCK PROJECT:
-   - vol_clf_score feature and the whole Volume Classifier relationship
-     described in the original module docstring
-   - build_sector_price_cache / RS_BENCHMARK (SPY) — no sectors, no
-     single-benchmark relative strength for currencies (CSI_rs, a
-     feature already in SIGNAL_FEATURE_COLS, replaces both)
-   - market_ind_df (Market Pulse from SPY/QQQ/DIA) — replaced by
-     csi_commodity_bloc, already part of the feature vector
-   - GFT_TICKERS watchlist diagnostic — a 15-stock evaluation-account
-     artifact specific to the stock project, with no FX equivalent.
-     Dropped entirely rather than stubbed with a placeholder list.
+4. NO `direction` PARAMETER ANYWHERE. score_candidates() is replaced
+   by predict_direction(), which predicts direction directly for every
+   pair in a basket — there is no external candidate list to rank.
+
+5. PER-BASKET FEATURE COLUMNS, NOT ONE SHARED LIST. Since macro driver
+   features were added (see ml/features.py — usd gets 12 macro
+   columns from DXY/GOLD/US10Y, cad/chf/jpy/crosses each get 4 from
+   their single driver), a basket's feature-column set is no longer
+   identical across all 5 models. Both train_directional_model() and
+   predict_direction() now call
+   ml.features.get_directional_feature_cols(basket_name) to get THAT
+   basket's correct column list, instead of importing a single flat
+   DIRECTIONAL_FEATURE_COLS constant — using the flat constant here
+   would have silently trained/scored the usd model on only 4 of its
+   12 macro columns (whichever the base list happened to include),
+   with no error raised anywhere.
+
+Every threshold/period below is read live from config.yaml.
 """
 
 import pickle
@@ -74,12 +73,11 @@ from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.metrics import (precision_score, recall_score,
                               f1_score, roc_auc_score, average_precision_score)
-from sklearn.metrics import make_scorer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.calibration import CalibratedClassifierCV
 
-from ml.features import SIGNAL_FEATURE_COLS, compute_signal_features
+from ml.features import get_directional_feature_cols, compute_directional_features
 from utils.logging import get_ml_logger
 from utils.error_handler import MLError
 
@@ -88,8 +86,6 @@ logger = get_ml_logger()
 
 # =============================================================================
 # CONFIG
-# Every threshold/period below is read live from config.yaml — nothing
-# in this file hardcodes a value that config already owns.
 # =============================================================================
 
 def _load_config() -> dict:
@@ -97,49 +93,89 @@ def _load_config() -> dict:
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
-config     = _load_config()
-ML_CFG     = config["ml"]
-LINREG_CFG = config["linreg"]
+config = _load_config()
+ML_CFG = config["ml"]
 
 MIN_SAMPLES         = ML_CFG["min_training_samples"]
-HIGH_PROB_THRESHOLD = ML_CFG["high_probability_threshold"]
-GAP                 = ML_CFG["label_forward_periods"]
-LINREG_PERIOD       = LINREG_CFG["period"]
+DISPLAY_THRESHOLD   = ML_CFG["high_probability_threshold"]
+HORIZON             = ML_CFG["label_forward_periods"]
 
-MODEL_DIR  = Path(__file__).resolve().parents[1] / "models"
-MODEL_PATH = MODEL_DIR / "signal_ranker.pkl"
+MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
 
-# The train/test and CV gap must be AT LEAST as large as the biggest
-# feature lookback window, or validation rows can share overlapping
-# history with training rows (leakage) even though they're on
-# "different" datetimes. LinReg features look back up to LINREG_PERIOD
-# (200 4H-candles) candles — this is read live from config, not
-# hardcoded, so a future config change to linreg.period automatically
-# widens this gap too.
-SAFETY_GAP = GAP+10
+# The train/test and CV gap must be AT LEAST as large as the label's
+# own forward-looking HORIZON, or a training row near the boundary can
+# have its label computed from a future close that falls inside the
+# test window. HORIZON is the correct thing to size this gap against
+# now that LinReg (which used to size it) is dropped.
+SAFETY_GAP = HORIZON + 5
+
+EVAL_THRESHOLDS = sorted(set([0.6, 0.65,0.68, 0.7, 0.8, DISPLAY_THRESHOLD]))
+
+
+# =============================================================================
+# CROSS-PAIR-SAFE TRAIN/TEST SPLIT
+# =============================================================================
+
+def _split_by_datetime_boundary(
+    dates      : pd.Series,
+    train_frac : float = 0.70,
+    gap        : int   = 0,
+) -> tuple:
+    """
+    Split rows into train/test masks using a DATETIME boundary, not a
+    row-count percentile — every row sharing a given datetime
+    (regardless of pair) lands entirely on one side of the split.
+
+    Args:
+        dates     : The full 'datetime' column, one entry per row,
+                    potentially many pairs stacked
+        train_frac: Fraction of the UNIQUE datetime range for training
+        gap       : Number of unique datetime steps as a gap between
+                    train's end and test's start
+
+    Returns:
+        (train_mask, test_mask, train_end_dt, test_start_dt)
+    """
+    unique_dates = pd.Series(sorted(dates.unique()))
+
+    if len(unique_dates) < 3:
+        raise MLError(
+            f"_split_by_datetime_boundary: only {len(unique_dates)} unique "
+            f"datetime values — need at least 3."
+        )
+
+    split_idx = int(len(unique_dates) * train_frac)
+    split_idx = max(1, min(split_idx, len(unique_dates) - 2))
+
+    train_end_dt = unique_dates.iloc[split_idx - 1]
+
+    test_start_idx = split_idx + gap
+    if test_start_idx >= len(unique_dates):
+        logger.warning(
+            f"_split_by_datetime_boundary: gap={gap} leaves no room for "
+            f"a test set with only {len(unique_dates)} unique datetimes "
+            f"— falling back to no gap."
+        )
+        test_start_idx = split_idx
+
+    test_start_dt = unique_dates.iloc[test_start_idx]
+
+    train_mask = dates <= train_end_dt
+    test_mask  = dates >= test_start_dt
+
+    return train_mask, test_mask, train_end_dt, test_start_dt
 
 
 # =============================================================================
 # MODEL BUILDER
-# XGBoost hyperparameters are asset/timeframe-agnostic tuning choices —
-# carried over unchanged from the stock project, no FX-specific reason
-# to retune them here.
 # =============================================================================
 
 def _build_pipeline(scale_pos_weight: float = 1.0) -> Pipeline:
-    """
-    Build the sklearn Pipeline for the Signal Ranker.
-
-    Args:
-        scale_pos_weight: Ratio of negative to positive samples
-
-    Returns:
-        sklearn Pipeline
-    """
+    """Build the sklearn Pipeline for a basket's directional model."""
     base_model = XGBClassifier(
         n_estimators       = 400,
         max_depth          = 4,
-        learning_rate      = 0.05,
+        learning_rate      = 0.02,
         subsample          = 0.8,
         colsample_bytree   = 0.8,
         min_child_weight   = 3,
@@ -150,10 +186,7 @@ def _build_pipeline(scale_pos_weight: float = 1.0) -> Pipeline:
         random_state       = 42,
         n_jobs             = -1,
     )
-
-    # Isotonic calibration — cv=5 uses out-of-fold predictions to map
-    # probabilities without leaking data or overfitting to train set.
-    inner_cv = TimeSeriesSplit(n_splits=2, gap=SAFETY_GAP)
+    inner_cv = TimeSeriesSplit(n_splits= 2, gap = SAFETY_GAP)
     calibrated_model = CalibratedClassifierCV(
         estimator = base_model,
         method    = "isotonic",
@@ -169,364 +202,368 @@ def _build_pipeline(scale_pos_weight: float = 1.0) -> Pipeline:
 
 
 # =============================================================================
-# TRAINING
+# TRAINING — one basket at a time
 # =============================================================================
 
-def train_signal_ranker(
+def train_directional_model(
     feature_matrix: pd.DataFrame,
+    basket_name   : str,
 ) -> Tuple[Pipeline, dict]:
     """
-    Train the Signal Ranker on the labelled feature matrix.
+    Train one basket's directional model on its labelled feature matrix.
 
-    FLOW:
-    1. Validate minimum sample count
-    2. Separate features (X) from labels (y), drop identifier columns
-    3. Compute class imbalance ratio
-    4. Build pipeline
-    5. Cut a final OOS holdout FIRST (never touched during CV), with a
-       SAFETY_GAP buffer to prevent LinReg-lookback leakage across the
-       train/test boundary
-    6. Walk-forward cross-validation on TRAIN only
-    7. Train final model on TRAIN only
-    8. Evaluate on the untouched OOS test set
-    9. Save model to disk
+    TWO-STAGE TRAINING, per project decision:
+    1. EVALUATION: fit on the first ~70% of history (by date), measure
+       AUC/PR-AUC/precision/recall/CV scores/threshold table against
+       the held-out final ~30% (genuinely unseen data) — this is what
+       all the logged metrics describe, and is the honest answer to
+       "how well does this modeling approach generalize."
+    2. PRODUCTION: separately refit on 100% of history (train + the
+       held-out portion combined) — this is the model actually
+       returned and saved to disk. Withholding the most recent ~30%
+       of history (typically the most relevant/current data) from the
+       model that makes live predictions would be wasteful once the
+       approach has already been validated in stage 1.
+    The returned/saved model is therefore a DIFFERENT fit (different
+    weights, trained on more rows) than the one the logged metrics
+    describe — metrics measure the approach, not this exact file's
+    training data.
 
     Args:
-        feature_matrix: Output of build_signal_feature_matrix()
-                        Must contain SIGNAL_FEATURE_COLS + 'label'
+        feature_matrix: Output of build_directional_feature_matrix()
+                        for ONE basket's pairs. Must contain
+                        get_directional_feature_cols(basket_name) +
+                        'label' + 'pair' + 'datetime'.
+        basket_name   : e.g. 'usd', 'cad', 'chf', 'jpy', 'crosses'
 
     Returns:
-        Tuple of (trained Pipeline, metrics dict)
+        Tuple of (production Pipeline fit on full history, metrics
+        dict describing the train/held-out-OOS evaluation)
     """
     logger.info("=" * 60)
-    logger.info("SIGNAL RANKER TRAINING STARTING")
+    logger.info(f"DIRECTIONAL MODEL TRAINING STARTING | Basket: {basket_name}")
     logger.info("=" * 60)
 
-    # ── Step 1: Validate sample count ────────────────────────────────────────
     if len(feature_matrix) < MIN_SAMPLES:
         raise MLError(
-            f"Insufficient training samples: {len(feature_matrix)} "
-            f"(need {MIN_SAMPLES})"
+            f"{basket_name}: insufficient training samples: "
+            f"{len(feature_matrix)} (need {MIN_SAMPLES})"
         )
 
-    # ── Step 2: Separate features, labels, AND datetime ─────────────────────
-    # Keep datetime out of X — only used to split time.
-    df = feature_matrix.copy()
-    X  = df[SIGNAL_FEATURE_COLS].copy()
-    y  = df["label"].values
-
-    # Features are already sorted chronologically by build_signal_feature_matrix()
-    if "datetime" in df.columns:
-        dates = pd.to_datetime(df["datetime"])
-    else:
-        dates = pd.Series(range(len(df)), index=df.index)
-        logger.warning(
-            "No 'datetime' column in feature matrix — "
-            "using row index as time proxy for walk-forward split"
+    if "pair" not in feature_matrix.columns or "datetime" not in feature_matrix.columns:
+        raise MLError(
+            f"{basket_name}: feature_matrix is missing 'pair' or 'datetime'."
         )
 
-    # ── Step 3: Class imbalance ratio ─────────────────────────────────────────
+    df    = feature_matrix.copy()
+    feature_cols = get_directional_feature_cols(basket_name)
+    X     = df[feature_cols].copy()
+    y     = df["label"].values
+    dates = pd.to_datetime(df["datetime"])
+    pairs_in_matrix = df["pair"].unique().tolist()
+
+    logger.info(f"{basket_name}: pairs in this matrix: {pairs_in_matrix}")
+    logger.info(f"{basket_name}: {len(feature_cols)} feature columns (incl. basket-specific macro drivers)")
+
     n_negative       = (y == 0).sum()
     n_positive       = (y == 1).sum()
     raw_ratio        = n_negative / n_positive if n_positive > 0 else 1.0
     scale_pos_weight = raw_ratio
 
     logger.info(
-        f"Class balance | "
-        f"Positive: {n_positive} | Negative: {n_negative} | "
+        f"{basket_name}: class balance | "
+        f"Up: {n_positive} | Down: {n_negative} | "
         f"Raw ratio: {raw_ratio:.2f} | scale_pos_weight: {scale_pos_weight:.2f}"
     )
 
-    # ── Step 4: Build pipeline ────────────────────────────────────────────────
     pipeline = _build_pipeline(scale_pos_weight)
 
-    # ── Step 5: Cut a FINAL HOLDOUT FIRST. Never touch this during CV ───────
-    # Last 30% by time = walk-forward reality check. SAFETY_GAP rows are
-    # dropped between train and test so test rows near the boundary can't
-    # share overlapping LinReg lookback history with training rows right
-    # before them.
-    split_idx  = int(len(dates) * 0.70)
-    test_start = split_idx + SAFETY_GAP
-
-    if test_start >= len(dates):
-        logger.warning(
-            f"SAFETY_GAP ({SAFETY_GAP}) leaves no room for an OOS test set "
-            f"with only {len(dates)} samples — falling back to no gap."
-        )
-        test_start = split_idx
-
-    train_mask = dates.index < dates.index[split_idx]
-    test_mask  = dates.index >= dates.index[test_start]
+    train_mask, test_mask, train_end_dt, test_start_dt = _split_by_datetime_boundary(
+        dates, train_frac=0.70, gap=SAFETY_GAP,
+    )
 
     X_train, y_train = X[train_mask], y[train_mask]
     X_test,  y_test  = X[test_mask],  y[test_mask]
 
     logger.info(
-        f"Walk-Forward Split | Train: {len(X_train)} | "
-        f"Gap: {test_start - split_idx} rows | "
-        f"OOS Test: {len(X_test)} | Ratio: {raw_ratio:.2f}:1"
+        f"{basket_name}: cross-pair-safe split | "
+        f"Train: {len(X_train)} rows (<= {train_end_dt}) | "
+        f"Gap: {HORIZON} weekly candles | "
+        f"OOS Test: {len(X_test)} rows (>= {test_start_dt}) | "
+        f"Ratio: {raw_ratio:.2f}:1"
     )
 
-    if "datetime" in df.columns:
-        train_dates    = dates[train_mask]
-        test_dates     = dates[test_mask]
-        train_pos_rate = y_train.mean() if len(y_train) > 0 else float("nan")
-        test_pos_rate  = y_test.mean()  if len(y_test)  > 0 else float("nan")
-        logger.info(
-            f"Train window | {train_dates.min()} -> {train_dates.max()} | "
-            f"Positive rate: {train_pos_rate:.4f}"
-        )
-        logger.info(
-            f"OOS window   | {test_dates.min()} -> {test_dates.max()} | "
-            f"Positive rate: {test_pos_rate:.4f}"
+    if len(X_train) == 0 or len(X_test) == 0:
+        raise MLError(
+            f"{basket_name}: split produced an empty train or test set "
+            f"(train={len(X_train)}, test={len(X_test)})."
         )
 
-    # ── Step 6: Cross-validation on TRAIN only ───────────────────────────────
-    # CV folds are all drawn from X_train (the oldest 70% of data) — none
-    # of them ever see the OOS test window above.
+    train_pos_rate = y_train.mean() if len(y_train) > 0 else float("nan")
+    test_pos_rate  = y_test.mean()  if len(y_test)  > 0 else float("nan")
+    logger.info(
+        f"{basket_name}: train positive rate {train_pos_rate:.4f} | "
+        f"OOS positive rate {test_pos_rate:.4f}"
+    )
+
     cv = TimeSeriesSplit(n_splits=5, gap=SAFETY_GAP)
 
     cv_auc_roc = cross_val_score(pipeline, X_train, y_train, cv=cv,
                                   scoring="roc_auc", n_jobs=-1)
     cv_pr_auc  = cross_val_score(pipeline, X_train, y_train, cv=cv,
                                   scoring="average_precision", n_jobs=-1)
-
-    precision_scorer = make_scorer(precision_score, zero_division=0)
-    cv_precision = cross_val_score(pipeline, X_train, y_train, cv=cv,
-                                    scoring=precision_scorer, n_jobs=-1)
+    cv_precision  = cross_val_score(pipeline, X_train, y_train, cv=cv,
+                                  scoring="precision", n_jobs=-1)
+    cv_recall     = cross_val_score(pipeline, X_train, y_train, cv=cv,
+                                  scoring="recall", n_jobs=-1)
 
     logger.info(
-        f"Cross-validation | "
-        f"AUC-ROC:   {cv_auc_roc.mean():.4f} +/- {cv_auc_roc.std():.4f} | "
-        f"PR-AUC:    {cv_pr_auc.mean():.4f} +/- {cv_pr_auc.std():.4f} | "
-        f"Precision: {cv_precision.mean():.4f} +/- {cv_precision.std():.4f}"
+        f"{basket_name}: cross-validation | "
+        f"AUC-ROC: {cv_auc_roc.mean():.4f} +/- {cv_auc_roc.std():.4f} | "
+        f"PR-AUC:  {cv_pr_auc.mean():.4f} +/- {cv_pr_auc.std():.4f}"
+        f"Precision:  {cv_precision.mean():.4f} +/- {cv_precision.std():.4f}"
+        f"Recall:  {cv_recall.mean():.4f} +/- {cv_recall.std():.4f}"
     )
 
-    # ── Step 7: Train FINAL model on TRAIN only ─────────────────────────────
-    logger.info("Training final model on TRAIN set only...")
+    logger.info(f"{basket_name}: training final model on TRAIN set only...")
     pipeline.fit(X_train, y_train)
 
     y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
-    y_pred       = (y_pred_proba >= 0.60).astype(int)
     logger.info(
-        f"OOS Probability Spread | "
-        f"Max: {y_pred_proba.max():.4f} | Mean: {y_pred_proba.mean():.4f}"
+        f"{basket_name}: OOS probability spread | "
+        f"Min: {y_pred_proba.min():.4f} | Max: {y_pred_proba.max():.4f} | "
+        f"Mean: {y_pred_proba.mean():.4f}"
     )
 
-    precision = precision_score(y_test, y_pred, zero_division=0)
-    recall    = recall_score(y_test, y_pred, zero_division=0)
-    f1        = f1_score(y_test, y_pred, zero_division=0)
-    auc_roc   = roc_auc_score(y_test, y_pred_proba)
-    pr_auc    = average_precision_score(y_test, y_pred_proba)
+    threshold_table = []
+    for threshold in EVAL_THRESHOLDS:
+        y_pred_at_t = (y_pred_proba >= threshold).astype(int)
+        n_predicted_positive = int(y_pred_at_t.sum())
 
-    logger.info(
-        f"OOS Test Metrics | Precision: {precision:.4f} | Recall: {recall:.4f} | "
-        f"F1: {f1:.4f} | AUC-ROC: {auc_roc:.4f} | PR-AUC: {pr_auc:.4f}"
+        precision_at_t = precision_score(y_test, y_pred_at_t, zero_division=0)
+        recall_at_t    = recall_score(y_test, y_pred_at_t, zero_division=0)
+        f1_at_t        = f1_score(y_test, y_pred_at_t, zero_division=0)
+
+        threshold_table.append({
+            "threshold": threshold,
+            "n"        : n_predicted_positive,
+            "precision": round(precision_at_t, 4),
+            "recall"   : round(recall_at_t, 4),
+            "f1"       : round(f1_at_t, 4),
+        })
+
+        logger.info(
+            f"{basket_name}: threshold={threshold:.2f} | "
+            f"n={n_predicted_positive} | "
+            f"Precision={precision_at_t:.4f} | Recall={recall_at_t:.4f} | "
+            f"F1={f1_at_t:.4f}"
+        )
+
+    auc_roc = roc_auc_score(y_test, y_pred_proba)
+    pr_auc  = average_precision_score(y_test, y_pred_proba)
+
+    display_row = next(
+        (row for row in threshold_table if row["threshold"] == DISPLAY_THRESHOLD),
+        threshold_table[-1],
     )
 
-    # ── Precision at top 2% of signals — a real-trading-relevant metric ─────
     results_df = pd.DataFrame({
         "true_label" : y_test,
         "probability": y_pred_proba,
     }).sort_values("probability", ascending=False)
 
-    top_2_percent_cutoff = max(1, int(len(results_df) * 0.02))
-    top_signals          = results_df.head(top_2_percent_cutoff)
+    top_5_percent_cutoff = max(1, int(len(results_df) * 0.05))
+    top_signals          = results_df.head(top_5_percent_cutoff)
     top_precision        = top_signals["true_label"].mean()
 
     logger.info(
-        f"Real Trading Metrics | "
-        f"Win Rate of Top 2% Signals: {top_precision:.4f} "
+        f"{basket_name}: real trading metric | "
+        f"Win Rate of Top 5% OOS Predictions: {top_precision:.4f} "
         f"(Baseline: {y_test.mean():.4f})"
     )
 
     metrics = {
-        "model_name"        : "signal_ranker",
+        "model_name"        : f"directional_{basket_name}",
         "train_date"        : datetime.today().strftime("%Y-%m-%d"),
-        "precision"         : round(precision, 4),
-        "recall"            : round(recall, 4),
-        "f1"                : round(f1, 4),
+        "precision"         : display_row["precision"],
+        "recall"            : display_row["recall"],
+        "f1"                : display_row["f1"],
         "auc_roc"           : round(auc_roc, 4),
         "pr_auc"            : round(pr_auc, 4),
         "cv_auc_mean"       : round(cv_auc_roc.mean(), 4),
         "cv_auc_std"        : round(cv_auc_roc.std(), 4),
         "cv_pr_mean"        : round(cv_pr_auc.mean(), 4),
         "cv_pr_std"         : round(cv_pr_auc.std(), 4),
-        "cv_precision_mean" : round(cv_precision.mean(), 4),
-        "cv_precision_std"  : round(cv_precision.std(), 4),
+        "threshold_table"   : threshold_table,
+        "top_5pct_win_rate" : round(top_precision, 4),
         "n_train"           : len(X_train),
         "n_test"            : len(X_test),
     }
 
     logger.info(
-        f"Final metrics | "
-        f"Precision: {precision:.4f} | "
-        f"Recall: {recall:.4f} | "
-        f"F1: {f1:.4f} | "
-        f"PR-AUC: {pr_auc:.4f} | "
-        f"AUC-ROC: {auc_roc:.4f} | "
-        f"CV AUC-ROC: {cv_auc_roc.mean():.4f} +/- {cv_auc_roc.std():.4f}"
+        f"{basket_name}: final metrics | "
+        f"AUC-ROC: {auc_roc:.4f} | PR-AUC: {pr_auc:.4f} | "
+        f"At display threshold {DISPLAY_THRESHOLD}: "
+        f"Precision={display_row['precision']:.4f} Recall={display_row['recall']:.4f} n={display_row['n']}"
     )
 
-    # ── Step 9: Save model to disk ────────────────────────────────────────────
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(pipeline, f)
 
-    logger.info(f"Signal Ranker saved to {MODEL_PATH}")
+    # ── Evaluation model (train-only) is DONE at this point — pipeline
+    # above was fit on X_train/y_train (the first ~70% of history) and
+    # every metric logged so far (CV scores, OOS AUC/precision/recall,
+    # threshold table, top-5% win rate) is measured against data that
+    # model never saw. That's the correct way to measure "how well does
+    # this approach generalize" — keep all of that exactly as-is.
+    #
+    # PRODUCTION model is a SEPARATE fit, on ALL available data (X, y —
+    # train + the held-out OOS portion combined), per project decision:
+    # the 70/30 split is an evaluation methodology, not a reason to
+    # permanently withhold the most recent ~30% of history (typically
+    # the most RELEVANT/current data) from the model that actually
+    # makes live predictions. This is standard practice — validate on
+    # a holdout, then refit the final deployed artifact on everything
+    # once the approach is confirmed to work.
+    #
+    # This is a genuinely different fitted model (different weights)
+    # from the one evaluated above, since it's fit on more data — the
+    # AUC/precision/recall numbers logged above describe how well THIS
+    # APPROACH generalizes, not the exact weights being saved to disk.
+    logger.info(f"{basket_name}: refitting production model on FULL history ({len(X)} rows, train+OOS combined)...")
+
+    production_pipeline = _build_pipeline(scale_pos_weight)
+    production_pipeline.fit(X, y)
+
+    model_path = MODEL_DIR / f"directional_{basket_name}.pkl"
+    with open(model_path, "wb") as f:
+        pickle.dump(production_pipeline, f)
+
+    logger.info(
+        f"{basket_name}: production model saved to {model_path} | "
+        f"trained on {len(X)} rows (full history) — "
+        f"evaluation metrics above were measured on a separate "
+        f"train-only fit ({len(X_train)} rows) and describe this "
+        f"approach's expected generalization, not this exact model's "
+        f"training data"
+    )
     logger.info("=" * 60)
-    logger.info("SIGNAL RANKER TRAINING COMPLETE")
+    logger.info(f"DIRECTIONAL MODEL TRAINING COMPLETE | Basket: {basket_name}")
     logger.info("=" * 60)
 
-    return pipeline, metrics
+    return production_pipeline, metrics
 
 
 # =============================================================================
 # INFERENCE
 # =============================================================================
 
-def load_signal_ranker() -> Optional[Pipeline]:
-    """
-    Load the trained Signal Ranker from disk.
+def load_directional_model(basket_name: str) -> Optional[Pipeline]:
+    """Load one basket's trained directional model from disk."""
+    model_path = MODEL_DIR / f"directional_{basket_name}.pkl"
 
-    Returns:
-        Trained Pipeline or None if model not found
-    """
-    if not MODEL_PATH.exists():
+    if not model_path.exists():
         logger.warning(
-            f"Signal Ranker model not found at {MODEL_PATH}. "
-            f"Train the model first."
+            f"Directional model for {basket_name} not found at {model_path}. "
+            f"Train it first via ml/train_models.py."
         )
         return None
 
-    with open(MODEL_PATH, "rb") as f:
+    with open(model_path, "rb") as f:
         pipeline = pickle.load(f)
 
-    logger.info(f"Signal Ranker loaded from {MODEL_PATH}")
+    logger.info(f"Directional model loaded for {basket_name} from {model_path}")
     return pipeline
 
 
-def score_candidates(
-    candidates_df : pd.DataFrame,
+def predict_direction(
+    basket_name   : str,
+    basket_pairs  : list,
     prices_df     : pd.DataFrame,
-    indicators_df : pd.DataFrame,
     csi_df        : pd.DataFrame,
     signal_datetime,
     pipeline      : Optional[Pipeline] = None,
+    macro_features_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
-    Score all scanner candidates and rank them by probability.
-
-    FLOW:
-    1. Load model if not provided
-    2. For each candidate (pair + direction):
-       a. Compute full signal feature vector (CSI looked up from the
-          pre-computed universe-wide snapshot passed in, not
-          recomputed per pair)
-       b. Run predict_proba() -> success probability
-       c. Tag as high/normal probability
-    3. Sort by ml_score descending, within each direction
-    4. Assign ml_rank (1 = best)
-    5. Return updated candidates DataFrame
-
-    If model is not available yet (first run before training):
-    - All candidates get ml_score = 0.5 (neutral)
-    - Ranked by SD position instead
+    Predict direction for every pair in one basket, unconditionally.
+    Replaces score_candidates() entirely.
 
     Args:
-        candidates_df  : Output of run_scanner() — unranked candidates
-                         [pair, direction, ...]
-        prices_df      : Full OHLC data, all pairs
-        indicators_df  : Full indicator results, all pairs
+        basket_name    : e.g. 'basket1_usd'
+        basket_pairs   : List of pairs in this basket
+        prices_df      : Full OHLC data for at least this basket's pairs
         csi_df         : Output of run_csi_engine() for this
-                         signal_datetime — computed ONCE for the whole
-                         universe, not recomputed per candidate (CSI is
-                         inherently cross-pair, see engines/csi.py)
+                         signal_datetime
         signal_datetime: Timestamp of this scan run
-        pipeline       : Optional pre-loaded model
+        pipeline       : Optional pre-loaded model for this basket
+        macro_features_df: Output of
+                         engines.macro.get_macro_features_for_basket()
+                         for THIS basket — same object passed to every
+                         pair in the loop below (macro data isn't
+                         pair-specific, just basket-specific). Falls
+                         back to 0.0 for this basket's macro columns if
+                         not provided, matching
+                         compute_directional_features's own fallback.
 
     Returns:
-        candidates_df with ml_score and ml_rank columns filled
+        DataFrame [pair, up_probability], one row per pair that had
+        enough history. The caller applies the display threshold.
     """
     if pipeline is None:
-        pipeline = load_signal_ranker()
+        pipeline = load_directional_model(basket_name)
 
     if pipeline is None:
         logger.warning(
-            "Signal Ranker not available — "
-            "using SD position as preliminary ranking"
+            f"{basket_name}: model not available — returning empty "
+            f"predictions for all {len(basket_pairs)} pairs"
         )
-        candidates_df = candidates_df.copy()
-        candidates_df["ml_score"] = 0.5
-        candidates_df = candidates_df.sort_values(
-            "sd_position",
-            key=lambda x: x.abs(),
-            ascending=True,
-        )
-        candidates_df["ml_rank"] = range(1, len(candidates_df) + 1)
-        return candidates_df
+        return pd.DataFrame(columns=["pair", "up_probability"])
+
+    feature_cols = get_directional_feature_cols(basket_name)
 
     results = []
+    skipped = []
 
-    for _, row in candidates_df.iterrows():
-        pair      = row["pair"]
-        direction = row["direction"]
-
-        px = prices_df[
-            prices_df["pair"] == pair
-        ].sort_values("datetime")
+    for pair in basket_pairs:
+        px = prices_df[prices_df["pair"] == pair].sort_values("datetime")
 
         try:
-            features = compute_signal_features(
+            features = compute_directional_features(
                 pair            = pair,
                 signal_datetime = signal_datetime,
-                direction       = direction,
                 prices_df       = px,
-                indicators_df   = indicators_df,
                 csi_df          = csi_df,
+                macro_features_df = macro_features_df,
             )
 
             if features is None:
-                ml_score = 0.5
-            else:
-                X        = pd.DataFrame([features])[SIGNAL_FEATURE_COLS]
-                ml_score = float(pipeline.predict_proba(X)[0][1])
+                skipped.append(pair)
+                continue
+
+            X = pd.DataFrame([features])[feature_cols]
+            up_probability = float(pipeline.predict_proba(X)[0][1])
 
         except Exception as e:
-            logger.warning(f"{pair} | Signal scoring failed: {e}")
-            ml_score = 0.5
+            logger.warning(f"{basket_name} | {pair} | Prediction failed: {e}")
+            skipped.append(pair)
+            continue
 
-        result_row = row.to_dict()
-        result_row["ml_score"] = round(ml_score, 4)
-        results.append(result_row)
+        results.append({
+            "pair"           : pair,
+            "up_probability" : round(up_probability, 4),
+        })
+
+    if skipped:
+        logger.info(f"{basket_name}: skipped {len(skipped)} pairs (insufficient history): {skipped}")
 
     result_df = pd.DataFrame(results)
 
-    # ── Sort by ml_score descending within each direction ─────────────────────
-    longs = result_df[result_df["direction"] == "long"].sort_values(
-        "ml_score", ascending=False
-    ).reset_index(drop=True)
+    if not result_df.empty:
+        result_df = result_df.sort_values("up_probability", ascending=False).reset_index(drop=True)
 
-    shorts = result_df[result_df["direction"] == "short"].sort_values(
-        "ml_score", ascending=False
-    ).reset_index(drop=True)
-
-    longs["ml_rank"]  = longs.index + 1
-    shorts["ml_rank"] = shorts.index + 1
-
-    final = pd.concat([longs, shorts], ignore_index=True)
-
-    high_prob = final[final["ml_score"] >= HIGH_PROB_THRESHOLD]
     logger.info(
-        f"Signal Ranker scoring complete | "
-        f"Total candidates: {len(final)} | "
-        f"High probability (>={HIGH_PROB_THRESHOLD}): {len(high_prob)}"
+        f"{basket_name}: predictions complete | "
+        f"{len(result_df)}/{len(basket_pairs)} pairs scored"
     )
 
-    if not high_prob.empty:
-        logger.info(
-            f"Top candidates:\n"
-            f"{high_prob[['pair','direction','ml_score','ml_rank']].to_string(index=False)}"
-        )
-
-    return final
+    return result_df

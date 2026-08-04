@@ -144,7 +144,66 @@ def _compute_patterns(open_: float, high: float, low: float, close: float) -> di
 
 
 # =============================================================================
+# RAW PATTERN FLAGS — no extreme gate, no direction interaction
+# Added for the project's redefined directional-prediction task: with
+# LinReg (and its sd_position) dropped from the feature set entirely,
+# and no externally-supplied trade direction to gate against (the model
+# now PREDICTS direction rather than being scored against a chosen
+# one), the hand-crafted "at extreme, direction-aware" interaction this
+# module was originally built around no longer has anything to anchor
+# to. Per project decision: don't rebuild the extreme gate on a new
+# basis — just expose the raw pattern flags and let the model learn
+# when they matter, using ADX/CSI/ATR-regime as its context instead.
+# compute_candlestick_latest and _compute_hammer_at_extreme below are
+# KEPT, not deleted — they're harmless, well-tested code that simply
+# isn't called by the new features.py. Removing them would be a bigger,
+# riskier change than leaving unused-but-correct code in place.
+# =============================================================================
+
+def compute_raw_pattern_flags(
+    pair: str,
+    df  : pd.DataFrame,
+) -> Optional[dict]:
+    """
+    Detect Hammer / Shooting Star on the latest candle only — no
+    extreme-SD gate, no direction interaction. This is the entry point
+    the redefined-task features.py uses; compute_candlestick_latest
+    (below) remains for any caller that still has sd_position/direction
+    available and wants the original gated interaction.
+
+    Args:
+        pair: FX pair symbol, e.g. 'EURUSD' (used for logging only)
+        df  : OHLC DataFrame for this pair, sorted datetime ascending,
+              already filtered to <= the signal datetime by the caller
+
+    Returns:
+        Dict with is_hammer (int 0/1) and is_shooting_star (int 0/1),
+        or None if there's no candle to evaluate
+    """
+    if df is None or df.empty:
+        logger.debug(f"{pair} | No candle available for pattern detection")
+        return None
+
+    last_candle = df.iloc[-1]
+
+    patterns = _compute_patterns(
+        open_ = float(last_candle["open"]),
+        high  = float(last_candle["high"]),
+        low   = float(last_candle["low"]),
+        close = float(last_candle["close"]),
+    )
+
+    return {
+        "is_hammer"       : int(patterns["is_hammer"]),
+        "is_shooting_star": int(patterns["is_shooting_star"]),
+    }
+
+
+# =============================================================================
 # STEP 2 & 3 — EXTREME GATE + DIRECTION-AWARE INTERACTION
+# Kept for backward compatibility — not called by the redefined-task
+# features.py (see compute_raw_pattern_flags above), but left in place
+# rather than deleted since it's correct, tested code.
 # =============================================================================
 
 def _compute_hammer_at_extreme(

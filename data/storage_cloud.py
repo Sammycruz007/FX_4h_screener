@@ -1,7 +1,7 @@
 """
 data/storage_cloud.py
 ----------------------
-FULL raw 4H-price history for cloud training, stored as Parquet
+FULL raw Weekly-price history for cloud training, stored as Parquet
 snapshots in Supabase Storage (NOT Postgres — keeps Supabase DB rows
 free-tier friendly).
 
@@ -9,7 +9,7 @@ WHY THIS EXISTS:
 run_pipeline_cloud.py fetches OHLCV and discards it after computing
 indicators — Supabase Postgres was never meant to hold raw_prices (see
 database_cloud.py docstring). But train_models.py needs a long window
-of raw 4H OHLCV history to backfill indicators and give the model
+of raw Weekly OHLCV history to backfill indicators and give the model
 exposure to multiple market regimes. This module holds that history
 cheaply.
 
@@ -19,10 +19,13 @@ rolling window (a rolling read would silently lose the large first-run
 backfill once it aged out — see read_price_history()'s docstring).
 But leaving snapshot FILES to accumulate forever isn't right either:
 Supabase's free tier caps total object count as well as total bytes,
-and with runs happening twice a day (see scheduler.run_times in
-config.yaml), file count would grow unbounded even though the
+and however often this pipeline actually runs now (check
+scheduler.run_times in config.yaml directly — this comment previously
+assumed the old 4H-scan design's "twice a day" cadence, which is
+likely stale now that this project predicts weekly candles instead),
+file count would grow unbounded even though the
 underlying DATA volume stays small and bounded by
-storage.retention_days (~2.5 years). consolidate_snapshots() is called
+storage.retention_days. consolidate_snapshots() is called
 every pipeline run: it reads everything, dedupes on (pair, datetime),
 trims anything older than retention_days, writes ONE fresh
 consolidated file, then deletes every old chunk — safe because the
@@ -38,9 +41,11 @@ history that exists anywhere in this architecture. train_models.py's
 read_price_history() reconstructs the FULL backfill window from all
 accumulated history — that is the entire mechanism by which training
 gets multi-regime historical data. Deleting a run's data right after
-that run would permanently lose it (not re-fetchable later, since
-yfinance's history window is finite — fetcher.py's 729-day 1H
-ceiling), and would break fetcher.py's incremental fetch design, which
+that run would permanently lose it (not re-fetchable later — even
+though Weekly bars have no comparable yfinance ceiling the way 1H
+data once did, see fetcher.py's docstring, yfinance still can't
+retroactively recreate data if this project's own accumulated copy
+were deleted), and would break fetcher.py's incremental fetch design, which
 relies on accumulated Storage history for everything older than its
 tiny per-run delta. Consolidation solves this correctly: it keeps
 every row inside the retention window, and only removes rows/files
@@ -62,10 +67,10 @@ so both of a day's runs are preserved independently. See
 _parse_run_timestamp_from_filename() for the corresponding read-side fix.
 
 INCREMENTAL FETCH CHANGES THE SNAPSHOT SHAPE:
-Run 1's snapshot is large (full ~729-day backfill for every pair,
-since nothing is tracked yet). Every run after is tiny (just each
-pair's new 4H candles since the last run, via fetcher.py's genuine
-cloud incremental fetch). Both shapes are handled by the same
+Run 1's snapshot is large (a full multi-year Weekly backfill for every
+pair, since nothing is tracked yet). Every run after is tiny (just
+each pair's new Weekly candles since the last run, via fetcher.py's
+genuine cloud incremental fetch). Both shapes are handled by the same
 chunked-write / read-everything logic below — no special-casing needed.
 
 BUCKET LAYOUT (chunked — see note below):
@@ -218,11 +223,11 @@ def _parse_run_timestamp_from_filename(name: str) -> Optional[datetime]:
 
 def write_snapshot(df: pd.DataFrame, run_timestamp: datetime) -> bool:
     """
-    Write a run's raw 4H OHLC DataFrame to Supabase Storage as chunked
+    Write a run's raw Weekly OHLC DataFrame to Supabase Storage as chunked
     Parquet files (each under the 50MB per-file Storage limit).
 
     Args:
-        df           : Raw 4H OHLC DataFrame (pair, datetime, open,
+        df           : Raw Weekly OHLC DataFrame (pair, datetime, open,
                        high, low, close)
         run_timestamp: This pipeline run's UTC timestamp (NOT just a
                        date — see module docstring on why the
@@ -327,9 +332,10 @@ def read_price_history(days: Optional[int] = None) -> pd.DataFrame:
     DON'T DELETE SNAPSHOTS" section for the full reasoning.
 
     WHY NO DEFAULT WINDOW: the incremental fetcher means the first
-    run's snapshot is large (full ~729-day backfill for every pair,
-    since nothing is tracked yet) and every run after is tiny (just
-    each pair's new 4H candles). A rolling "last N days" read would
+    run's snapshot is large (a full multi-year Weekly backfill for
+    every pair, since nothing is tracked yet) and every run after is
+    tiny (just each pair's new Weekly candles). A rolling "last N days"
+    read would
     silently lose almost the entire dataset once the first run's
     snapshot aged out of the window. Reading everything and relying on
     drop_duplicates(subset=["pair","datetime"]) to merge correctly is
@@ -439,9 +445,14 @@ def consolidate_snapshots(retention_days: int) -> bool:
     retention-trimmed snapshot, then delete every old chunk.
 
     WHY THIS EXISTS: without any pruning, every pipeline run adds new
-    chunk files forever — twice a day, indefinitely. The underlying
-    data volume stays small (28 pairs, 4H candles, bounded by
-    retention_days — comfortably under Supabase's free-tier limits),
+    chunk files forever, however often the pipeline runs (NOTE: this
+    comment previously said "twice a day," matching the old 4H-scan
+    schedule — that cadence assumption is likely stale now that this
+    project predicts weekly candles; verify the actual current run
+    frequency in daily_scan.yml rather than trust this comment's
+    original number). The underlying data volume stays small (28
+    pairs, Weekly candles, bounded by retention_days — comfortably
+    under Supabase's free-tier limits),
     but the FILE COUNT does not stay bounded on its own, and Supabase's
     free tier caps total object count as well as total bytes. A naive
     age-based delete (the stock project's prune_old_snapshots, kept
