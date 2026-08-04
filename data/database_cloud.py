@@ -8,72 +8,6 @@ Used by:
 - run_pipeline_cloud.py  (GitHub Actions)
 - dashboard/app_cloud.py (Streamlit Cloud)
 
-DIFFERENCE FROM database.py:
-- Uses psycopg2 (PostgreSQL) instead of sqlite3
-- Reads connection string from SUPABASE_DB_URL environment variable
-- Only stores RESULT tables (no raw_prices — too large for Supabase
-  free tier). Raw Weekly OHLC lives in Supabase Storage as Parquet
-  snapshots instead (see data/storage_cloud.py), not here.
-
-TABLES STORED IN SUPABASE:
-- indicator_results   (ADX + CSI + candlestick pattern flags per pair
-  per weekly-candle datetime)
-- prediction_results  (basket-model directional predictions that
-  cleared the display threshold)
-- model_metrics       (per-basket ML model performance)
-- fetch_tracker       (per-pair incremental-fetch bookkeeping)
-- all_predictions_log (EVERY basket-model prediction, every run,
-  regardless of display threshold — added for live-tracking/
-  continuation-vs-flip comparisons, since prediction_results only
-  ever holds threshold-clearing rows and can't answer "what did this
-  pair predict yesterday" if yesterday's prediction happened to be
-  sub-threshold)
-- prediction_outcomes (once a prediction's validity window has
-  elapsed, whether price actually moved in the predicted direction —
-  the live accuracy tracker, evaluated against actual closes as they
-  become available, separate from the original backtest's AUC/
-  precision, which only ever measured historical held-out data)
-
-WHAT'S DIFFERENT FROM THE PRIOR (SIGNAL RANKER SCANNER) VERSION OF
-THIS FILE — THIS IS A REDESIGN OF THE SCHEMA, NOT A RENAME:
-
-1. indicator_results DROPS EVERY LINREG/SMC COLUMN. LinReg and SMC are
-   dropped from this project's scope entirely (per project decision —
-   see ml/features.py's module docstring). This table no longer has
-   linreg_value, linreg_slope, linreg_slope_up, sd1/2/3_upper/lower,
-   price_sd_position, smc_structure, has_valid_zone — none of these
-   are computed anywhere in the pipeline anymore. What remains:
-   adx_value/plus_di/minus_di, the 6 CSI columns, and
-   is_hammer/is_shooting_star (now raw pattern flags with no extreme
-   gate — see engines/candlestick.py's compute_raw_pattern_flags).
-
-2. scan_results IS GONE, REPLACED BY prediction_results. The old table
-   held scanner CANDIDATES (pair, direction, sd_position,
-   has_valid_zone, ml_score, ml_rank) — that whole concept no longer
-   exists. prediction_results holds basket-model directional
-   PREDICTIONS instead: (pair, datetime, basket, up_probability,
-   direction, confidence). Key differences:
-     - Keyed on (pair, datetime, BASKET) not (pair, datetime,
-       direction) — a pair belongs to exactly one basket, and the
-       basket identity matters for knowing which model produced a
-       given prediction.
-     - up_probability is the model's raw output; direction ("up"/
-       "down") and confidence (symmetric around 0.5) are DERIVED from
-       it, not independently modeled.
-     - This table ONLY EVER holds rows that already cleared the
-       display threshold (config.yaml's ml.high_probability_threshold)
-       — per project decision, rows that don't clear it are never
-       written here at all. The old scan_results table held EVERY
-       candidate regardless of ml_score; this is a deliberate change.
-
-3. model_metrics is UNCHANGED IN SCHEMA — model_name now holds values
-   like "directional_basket1_usd" instead of "signal_ranker", but the
-   table structure needed no changes — it was already model-agnostic.
-
-4. fetch_tracker is UNCHANGED — still keyed on plain pair name.
-
-COLUMN NAMING (pair/datetime, not ticker/date):
-   Consistent with every other FX file.
 """
 
 import os
@@ -504,17 +438,36 @@ def get_previous_predictions(pair_basket_pairs: list) -> dict:
     if not pair_basket_pairs:
         return {}
 
-    sql = """
-        SELECT DISTINCT ON (pair, basket)
-            pair, basket, direction, up_probability, datetime
-        FROM all_predictions_log
-        WHERE (pair, basket) IN %s
-        ORDER BY pair, basket, datetime DESC
+    # NOTE: "WHERE (pair, basket) IN %s" with a Python list of tuples
+    # passed as a single psycopg2 parameter does NOT reliably perform
+    # a composite-key IN match — psycopg2 substitutes %s based on the
+    # outer sequence, not as nested Postgres row-value tuples, so this
+    # previously matched incorrectly (silently, with no error) rather
+    # than scoping each lookup to its specific (pair, basket) pair.
+    # That bug produced wrong "previous prediction" rows — e.g.
+    # matching a different basket's row for the same pair, or the
+    # wrong pair's row entirely — which is what caused GBPNZD's
+    # genuine direction flip (down -> up) to be mislabeled as
+    # "continuation," and EURAUD's real previous probability (0.5615)
+    # to be reported as something close to its OWN current value
+    # instead. Fixed by explicitly joining against a VALUES list of
+    # the exact (pair, basket) pairs requested, which Postgres matches
+    # correctly as a composite key.
+    values_clause = ", ".join(["(%s, %s)"] * len(pair_basket_pairs))
+    params = [item for pair_basket in pair_basket_pairs for item in pair_basket]
+
+    sql = f"""
+        SELECT DISTINCT ON (apl.pair, apl.basket)
+            apl.pair, apl.basket, apl.direction, apl.up_probability, apl.datetime
+        FROM all_predictions_log apl
+        JOIN (VALUES {values_clause}) AS wanted(pair, basket)
+            ON apl.pair = wanted.pair AND apl.basket = wanted.basket
+        ORDER BY apl.pair, apl.basket, apl.datetime DESC
     """
 
     with get_connection() as conn:
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cursor.execute(sql, (tuple(pair_basket_pairs),))
+        cursor.execute(sql, params)
         rows = cursor.fetchall()
 
     return {
