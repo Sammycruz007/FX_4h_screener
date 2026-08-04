@@ -4,7 +4,7 @@ on:
   schedule:
     # Daily candles (fetch_interval: "1d"), so the pipeline needs to
     
-    - cron: '50 12 * * *' # Runs at 1:50 UTC +1
+    - cron: '50 00 * * *' # Runs at 1:50 UTC +1
   # Allow manual trigger from GitHub Actions UI — split into its own
   # workflow (separate from model training, see train_models.yml) per
   #triggered it).
