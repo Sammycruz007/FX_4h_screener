@@ -96,7 +96,7 @@ from engines.adx import compute_adx_latest
 from engines.csi import compute_csi_series
 from engines.macro import get_macro_features_for_basket
 from ml.labeller  import label_direction
-from ml.features  import build_directional_feature_matrix
+from ml.features  import build_directional_feature_matrix, compute_atr_series, ATR_FAST_PERIOD
 from ml.signal_ranker import train_directional_model
 from utils.logging import get_ml_logger
 
@@ -347,6 +347,30 @@ def run_training():
         )
     else:
         logger.info(f"CSI backfill complete | {len(csi_series_df)} (pair, datetime) rows")
+
+    # ── ATR (fast) — computed ONCE PER PAIR across each pair's full
+    # sorted history, then reassembled back into prices_all_df.
+    #
+    # ml/labeller.py's label_direction() needs an atr_fast[t] value for
+    # EVERY historical row t (it's the move-size threshold: a row only
+    # labels BUY/SELL if the net move over the horizon clears
+    # min_move_atr_multiple * atr_fast[t]). features.py's _compute_atr()
+    # can't supply this — it deliberately returns a single scalar "ATR
+    # as of the latest row," built for live/scoring use where a caller
+    # has already sliced px down to "up to right now" for one pair. Use
+    # compute_atr_series() instead, the rolling per-row counterpart
+    # (same True Range formula, rolling(window).mean() instead of
+    # .tail().mean(), same no-look-ahead guarantee — row t only uses
+    # rows <= t).
+    logger.info(
+        f"Computing rolling ATR ({ATR_FAST_PERIOD}-period) per pair for "
+        f"the labeller's move-size threshold..."
+    )
+
+    for pair, px in prices_by_pair.items():
+        px["atr_fast"] = compute_atr_series(px, ATR_FAST_PERIOD)
+
+    prices_all_df = pd.concat(prices_by_pair.values(), ignore_index=True)
 
     # ── Macro features — computed ONCE PER BASKET (not per-pair, not
     # cross-basket like CSI) — each basket only needs its OWN
