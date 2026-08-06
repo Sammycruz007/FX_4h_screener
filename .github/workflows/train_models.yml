@@ -56,12 +56,21 @@ jobs:
       # depend on daily_predict.yml having run recently and successfully
       # — a hidden coupling between two workflows that are otherwise
       # now fully independent (see daily_predict.yml's docstring on why
-      # they were split apart). This step calls the exact same
-      # data/fetcher.py entry point daily_predict.yml's pipeline uses
-      # internally, so training always works on freshly-fetched data
-      # regardless of whether/when the other workflow last ran.
+      # they were split apart).
+      #
+      # FIX: this previously called data.fetcher.run_data_pipeline()
+      # directly, which writes to LOCAL SQLITE via
+      # data/database.py's write_raw_prices() — a leftover pre-Supabase
+      # code path. On a fresh GitHub Actions runner there is no existing
+      # SQLite file/schema, so that call failed with "no such table:
+      # raw_prices" every run. run_pipeline_cloud.py (the same entry
+      # point daily_predict.yml uses, see daily_predict.yml) fetches via
+      # data.fetcher.smart_fetch() and writes to SUPABASE, which is this
+      # project's actual source of truth post-migration. Calling it here
+      # keeps the fetch step consistent with daily_predict.yml's working
+      # path instead of the stale direct-SQLite one.
       - name: Fetch latest data before training
-        run: python -c "from data.fetcher import run_data_pipeline; run_data_pipeline()"
+        run: python run_pipeline_cloud.py
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
