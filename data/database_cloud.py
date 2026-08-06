@@ -657,16 +657,68 @@ def read_latest_indicator_results() -> pd.DataFrame:
         return pd.read_sql(sql, conn)
 
 
-def read_latest_prediction_results(basket: Optional[str] = None) -> pd.DataFrame:
+def read_latest_prediction_results(
+    basket: Optional[str] = None,
+    as_of_date: Optional[str] = None,
+) -> pd.DataFrame:
     """
-    Read the latest run's display-threshold predictions, optionally
-    filtered to one basket. Replaces read_latest_scan_results().
+    Read display-threshold predictions for a specific candle date,
+    optionally filtered to one basket.
+
+    Args:
+        basket    : Optional basket name to filter to.
+        as_of_date: 'YYYY-MM-DD' string for the candle date to read.
+                   If omitted, falls back to the table's own MAX(datetime)
+                   — kept for backward compatibility with any existing
+                   caller, but NOT recommended for a live dashboard: if
+                   TODAY'S run had zero predictions clear the display
+                   threshold (a real, expected outcome — see
+                   run_pipeline_cloud.py's STEP 10 log,
+                   "Predictions clearing display threshold: 0/28"), the
+                   table's global MAX(datetime) silently falls back to
+                   whatever the last run WITH qualifying predictions
+                   was, which could be days old. That produced exactly
+                   this symptom: a dashboard showing a stale pair
+                   (e.g. EURAUD @ 0.70 from days ago) as if it were
+                   today's result, with no indication it wasn't fresh.
+                   Callers that need "today, honestly, even if empty"
+                   MUST pass as_of_date explicitly (see
+                   app_cloud.py, which passes the same latest-candle
+                   date already computed for its header caption).
 
     Returns:
         DataFrame ordered by confidence descending — replaces the old
         ml_rank ordering, since there's no per-candidate rank concept
-        anymore, just confidence.
+        anymore, just confidence. Empty DataFrame if as_of_date was
+        given and that specific date has no qualifying rows — this is
+        the correct, honest result, not an error.
     """
+    if as_of_date:
+        if basket:
+            sql = """
+                SELECT * FROM prediction_results
+                WHERE datetime::date = %s
+                  AND basket = %s
+                ORDER BY confidence DESC
+            """
+            params = (as_of_date, basket)
+        else:
+            sql = """
+                SELECT * FROM prediction_results
+                WHERE datetime::date = %s
+                ORDER BY confidence DESC
+            """
+            params = (as_of_date,)
+
+        with get_connection() as conn:
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            return pd.DataFrame(rows)
+
+    # Backward-compatible fallback path (no as_of_date given) — see
+    # docstring warning above about why this isn't safe for a live
+    # "did today produce anything" dashboard view.
     if basket:
         sql = """
             SELECT * FROM prediction_results
