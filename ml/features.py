@@ -264,6 +264,51 @@ def _compute_atr(px: pd.DataFrame, period: int) -> float:
     return float(atr)
 
 
+def compute_atr_series(px: pd.DataFrame, period: int) -> pd.Series:
+    """
+    Rolling, per-row Average True Range over an entire price history —
+    the historical-labelling counterpart to _compute_atr() above.
+
+    _compute_atr() answers "what is ATR as of the LATEST row of px?"
+    (a single scalar) — built for live/scoring use, where the caller
+    already sliced px down to "everything up to right now" for one
+    pair. It has no way to hand back a value for every historical row,
+    which is what ml/labeller.py's label_direction() needs: an
+    atr_fast[t] for every row t in the training history, computed only
+    from data available AT t (no look-ahead).
+
+    This function computes the exact same True Range formula as
+    _compute_atr(), but via a rolling window over the whole series
+    rather than a single .tail(period) slice — so row t's ATR uses
+    only rows <= t, same no-look-ahead guarantee.
+
+    Args:
+        px    : OHLC DataFrame for a SINGLE pair, sorted datetime
+                ascending. Do not pass a multi-pair DataFrame directly
+                — call this once per pair (e.g. via groupby), the same
+                way callers already isolate one pair's data for
+                _compute_atr().
+        period: Rolling window size (ATR_FAST_PERIOD / ATR_SLOW_PERIOD)
+
+    Returns:
+        Series aligned to px's index. Rows with fewer than 2 prior
+        candles available fall back to 1% of that row's close — same
+        fallback _compute_atr() uses for an equivalently short history,
+        just applied per-row instead of once.
+    """
+    high_low   = px["high"] - px["low"]
+    high_close = (px["high"] - px["close"].shift(1)).abs()
+    low_close  = (px["low"]  - px["close"].shift(1)).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+
+    atr = true_range.rolling(window=period, min_periods=2).mean()
+
+    fallback = px["close"] * 0.01
+    atr = atr.fillna(fallback)
+
+    return atr
+
+
 # =============================================================================
 # BOLLINGER BANDS
 # Replaces LinReg's "where is price relative to its recent range" role
