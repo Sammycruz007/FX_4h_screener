@@ -33,11 +33,27 @@ logging:
 
 ml:
   high_probability_threshold: 0.68
-  # Locked: 2 weekly candles ahead (~2 weeks forward).
-  label_forward_periods: 2
+  # Locked: 3 daily candles ahead. Moved from 2 weekly candles as part
+  # of the directional-label redesign (see FX_Directional_Model_Redesign
+  # spec) — the label is no longer a plain close(t+H) > close(t) check,
+  # see min_move_atr_multiple / min_confirming_candles below for the
+  # rest of the new label definition.
+  label_forward_periods: 3
+  # New label definition (redesign spec):
+  #   BUY : close(t+H) - close(t) >=  min_move_atr_multiple * atr_fast[t],
+  #         AND at least min_confirming_candles of the H candles after t
+  #         close bullish.
+  #   SELL: close(t+H) - close(t) <= -min_move_atr_multiple * atr_fast[t],
+  #         AND at least min_confirming_candles of the H candles after t
+  #         close bearish.
+  #   Otherwise: discard (no label) — replaces the old unconditional
+  #   close(t+H) > close(t) label, which counted small, choppy net moves
+  #   as a full BUY/SELL even when price reversed mid-window.
+  min_move_atr_multiple: 0.8
+  min_confirming_candles: 2
   min_training_samples: 50
   model_retrain_days: 7
-  # Backfill every week, no skipping.
+  # Backfill every day, no skipping.
   backfill_stride: 1
 
 scheduler:

@@ -186,11 +186,23 @@ if indicator_df.empty:
 # prediction remains valid (label_forward_periods business days ahead
 # on daily bars — see config.yaml's ml.label_forward_periods).
 import datetime as _datetime
+import yaml as _yaml
+
+def _get_label_forward_periods() -> int:
+    """Read ml.label_forward_periods from config.yaml directly, so this
+    caption never drifts out of sync with the value the pipeline and
+    labeller actually train/predict against (this constant was
+    previously hardcoded here and silently went stale when the config
+    value changed)."""
+    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
+    with open(config_path, "r") as f:
+        cfg = _yaml.safe_load(f)
+    return cfg["ml"]["label_forward_periods"]
 
 def _add_business_days(start_date: _datetime.date, n: int) -> _datetime.date:
     """Add n business days (Mon-Fri) to start_date, skipping weekends —
     matches FX market closure, consistent with how label_direction()
-    itself must skip non-trading days when building the 2-day-ahead
+    itself must skip non-trading days when building the N-day-ahead
     label this validity window is meant to mirror."""
     current = start_date
     added   = 0
@@ -200,8 +212,8 @@ def _add_business_days(start_date: _datetime.date, n: int) -> _datetime.date:
             added += 1
     return current
 
-LABEL_FORWARD_PERIODS = 2  # matches config.yaml's ml.label_forward_periods
-                            # (daily bars: "2 business days ahead")
+LABEL_FORWARD_PERIODS = _get_label_forward_periods()  # from config.yaml's ml.label_forward_periods
+                            # (daily bars: "N business days ahead")
 
 fetch_dates = get_last_fetch_dates_bulk()  # {pair: "YYYY-MM-DD"}
 

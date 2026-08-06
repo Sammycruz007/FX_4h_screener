@@ -3,75 +3,83 @@ ml/labeller.py
 --------------
 Programmatic label generation for the FX directional models.
 
-LOGICAL FLOW — COMPLETE REDESIGN FROM THE PRIOR SIGNAL RANKER LABELLER:
+LOGICAL FLOW — LABEL REDESIGN (ATR-relative move + majority-candle
+confirmation, replacing the plain forward-return-sign label):
 ─────────────
-This project's task changed from "will a scanner-flagged setup reach a
-specific LinReg-band target within N candles" to a much simpler,
-unconditional question, asked of EVERY weekly candle for EVERY pair:
+The prior version of this file asked a simple, unconditional question
+of every daily candle for every pair:
 
-    "Is price higher 2 weekly candles from now than it is today?"
+    "Is price higher H candles from now than it is today?"
 
-    target = 1 if close[t + HORIZON] > close[t] else 0
-    target = 0 otherwise
+    target = 1 if close[t + H] > close[t] else 0
 
-This directly mirrors the EURUSD reference project's own label
-definition (see that project's README) — a plain forward-return sign
-check, not a fixed-target-hit search.
+That label technically counts as "correct" any path where price nets
+out positive by t+H, INCLUDING paths that dropped, rallied, then
+partially reversed again — a small, noisy net move that doesn't
+resemble a tradeable, sustained directional move at all. This is the
+exact failure mode described in the FX_Directional_Model_Redesign
+spec: a "successful" BUY often nets only 15-40 pips of genuine signal
+buried in what was mostly noise.
 
-WHAT'S DROPPED FROM THE PRIOR VERSION OF THIS FILE, AND WHY:
-   - label_scanner_hits() is GONE ENTIRELY. That function existed to
-     label scanner-flagged (pair, datetime, direction) CANDIDATES —
-     rows that had already passed a slope+SD-zone gate — against a
-     FIXED LinReg-snapshot target using np.searchsorted to check if
-     price ever touched that target within a forward window. NONE of
-     that applies anymore:
-       - There is no scanner/candidate concept in the new design —
-         every pair gets a directional prediction every week,
-         unconditionally, matching the reference project's "every
-         pair, every cycle" pattern. There is no "direction" input to
-         condition the label on, because the model predicts direction
-         itself rather than being scored against a pre-chosen one.
-       - There is no LinReg-derived target level to search for at all
-         — LinReg is dropped from this project's feature set entirely
-         per the project's redefined scope (28 pairs / basket models /
-         CSI+ADX+candlestick features only).
-       - The target itself changed from "did price EVER reach a level
-         within a window" (needs a forward SEARCH across the whole
-         window) to "is price higher at exactly one future point" (a
-         plain point-in-time comparison) — this is a fundamentally
-         simpler operation, no O(log n) searchsorted machinery needed.
-   - This means the labeller is now dramatically smaller. That's a
-     reflection of the task being genuinely simpler, not a shortcut.
+NEW LABEL DEFINITION (see FX_Directional_Model_Redesign spec):
+   For each (pair, t), looking H candles ahead (H = HORIZON, 3 daily
+   candles):
+
+       net_move = close[t+H] - close[t]
+
+       BUY (1)  if net_move >=  MIN_MOVE_ATR_MULTIPLE * atr_fast[t]
+                AND at least MIN_CONFIRMING_CANDLES of the H candles
+                in (t, t+H] close bullish (close > open)
+
+       SELL (0) if net_move <= -MIN_MOVE_ATR_MULTIPLE * atr_fast[t]
+                AND at least MIN_CONFIRMING_CANDLES of the H candles
+                in (t, t+H] close bearish (close < open)
+
+       otherwise: discard (no label — NOT zero-filled, NOT treated as
+       an ambiguous class of its own; the row is dropped from
+       training entirely)
+
+   This directly targets the "dip-then-reverse-then-technically-still-
+   positive" pattern: a small choppy net move that clears neither the
+   ATR-relative move-size bar nor the majority-of-candles-agree bar
+   gets discarded, not counted as a BUY/SELL.
+
+   MIN_MOVE_ATR_MULTIPLE and MIN_CONFIRMING_CANDLES are read from
+   ml.min_move_atr_multiple (0.8) and ml.min_confirming_candles (2) in
+   config.yaml. atr_fast is consumed as-is from prices_df (produced by
+   features.py's _compute_atr(px, ATR_FAST_PERIOD)) — this file does
+   NOT compute ATR itself.
+
+   This is a discard-heavy design BY INTENT, not a bug: the spec
+   explicitly trades label quantity for label quality (expected
+   precision 0.84-0.92 at threshold, recall as low as 0.15) — training
+   only on genuinely clean, directional examples rather than every
+   sample that happened to net positive/negative. Expect a meaningful
+   drop in usable rows per basket vs. the old label, especially on
+   choppy days, which are common in FX, not rare.
 
 WHAT'S KEPT FROM THE PRIOR VERSION, AND WHY:
    The hard-won datetime normalisation logic is kept nearly verbatim.
-   That code fixed two REAL, production-hit bugs unrelated to the old
-   target definition — (1) mismatched string-vs-Timestamp datetime
+   That code fixed two REAL, production-hit bugs unrelated to the
+   label definition — (1) mismatched string-vs-Timestamp datetime
    representations across DataFrames causing SILENT zero-match merges
    (no exception, just empty results), and (2) a numpy 2.x compatibility
    gap where searchsorted (and, by the same underlying comparison
    mechanism, any datetime equality/inequality check) can fail between
    a pandas.Timestamp and a datetime64 array unless explicitly
-   convertedfirst. Both risks apply just as much to the new simple
-   shift-based label as they did to the old search-based one, so this
-   defensive normalisation stays.
+   converted first. Both risks are independent of what the label
+   itself measures, so this defensive normalisation stays.
 
-LABEL DEFINITION:
-   For each pair, sorted by datetime ascending:
-       target[t] = 1 if close[t + HORIZON] > close[t] else 0
-   The last HORIZON rows of each pair's series have no valid future
-   close to compare against — those rows get target = NaN and are
-   DROPPED, not zero-filled (training on a fabricated "down" label for
-   rows where we simply don't know the outcome yet would corrupt the
-   model, same reasoning applied everywhere else in this project's
-   NaN-handling).
+   The "drop last H rows per pair, NaN not zero-filled" principle also
+   carries over unchanged — those rows have no valid future close to
+   compare against yet, and fabricating an outcome for them would
+   corrupt the model the same way it would have under the old label.
 
-   HORIZON is read from ml.label_forward_periods, which must now be
-   set to 2 (2 WEEKLY candles ahead) in config.yaml — this project
-   moved from a 4H timeframe (where this same config key held 30, ~1
-   week's worth of 4H candles) to native Weekly bars (see
-   data/fetcher.py's module docstring), so 2 weekly candles is now the
-   correct value for the SAME config key, not a new one.
+HORIZON:
+   HORIZON is read from ml.label_forward_periods, now 3 (3 DAILY
+   candles — this project moved from native Weekly bars to native
+   Daily bars; see data/fetcher.py's fetch_interval, already "1d").
+   The same config key is reused rather than introducing a new one.
 
 COLUMN NAMING (pair/datetime, not ticker/date):
    Consistent with every other FX file — 'pair' and 'datetime'
@@ -102,17 +110,43 @@ def _load_config() -> dict:
 config = _load_config()
 ML_CFG = config["ml"]
 
-# HORIZON: number of WEEKLY candles ahead the label looks. Same config
-# key as the old 4H-era labeller (ml.label_forward_periods), now
-# expected to be 2 (2 weekly candles), not 30 (the old ~1-week-in-4H-
-# candles value). See module docstring for the full reasoning.
+# HORIZON: number of DAILY candles ahead the label looks. Same config
+# key as before (ml.label_forward_periods), now expected to be 3 (3
+# daily candles), not 2 (the old weekly-era value). See module
+# docstring for the full reasoning.
 HORIZON = ML_CFG["label_forward_periods"]
 
 if HORIZON < 1:
     raise MLError(
         f"ml.label_forward_periods={HORIZON} is invalid — must be a "
-        f"positive integer number of weekly candles to look ahead "
-        f"(the reference design uses 2)."
+        f"positive integer number of daily candles to look ahead "
+        f"(the current design uses 3)."
+    )
+
+# MIN_MOVE_ATR_MULTIPLE: net move over the horizon must be at least
+# this many multiples of atr_fast[t] (in the label's direction) to
+# count as BUY/SELL rather than being discarded. Part of the
+# ATR-relative move-size filter — see module docstring.
+MIN_MOVE_ATR_MULTIPLE = ML_CFG["min_move_atr_multiple"]
+
+if MIN_MOVE_ATR_MULTIPLE <= 0:
+    raise MLError(
+        f"ml.min_move_atr_multiple={MIN_MOVE_ATR_MULTIPLE} is invalid "
+        f"— must be a positive number (the current design uses 0.8)."
+    )
+
+# MIN_CONFIRMING_CANDLES: at least this many of the HORIZON candles
+# after t must individually close in the label's direction (bullish
+# for BUY, bearish for SELL) for the sample to count. Part of the
+# majority-candle-confirmation filter — see module docstring.
+MIN_CONFIRMING_CANDLES = ML_CFG["min_confirming_candles"]
+
+if not (1 <= MIN_CONFIRMING_CANDLES <= HORIZON):
+    raise MLError(
+        f"ml.min_confirming_candles={MIN_CONFIRMING_CANDLES} is "
+        f"invalid — must be between 1 and ml.label_forward_periods "
+        f"(HORIZON={HORIZON}) inclusive (the current design uses 2 "
+        f"of 3)."
     )
 
 
@@ -168,9 +202,10 @@ def _normalise_datetime_column(df: pd.DataFrame, label: str) -> pd.DataFrame:
 
 # =============================================================================
 # DIRECTIONAL LABEL GENERATION
-# Replaces label_scanner_hits() entirely. Unconditional — every row for
-# every pair gets a label, not just scanner-flagged candidates (there
-# is no scanner/candidate concept in this design at all).
+# ATR-relative move + majority-candle-confirmation. Unconditional — every
+# row for every pair is evaluated, but many will be discarded (no label)
+# rather than forced into BUY/SELL. See module docstring for the full
+# label definition and reasoning.
 # =============================================================================
 
 def label_direction(prices_df: pd.DataFrame) -> pd.DataFrame:
@@ -180,42 +215,67 @@ def label_direction(prices_df: pd.DataFrame) -> pd.DataFrame:
     FLOW:
     1. Normalise the datetime column defensively (see module docstring)
     2. Sort each pair's rows chronologically
-    3. For each pair, compare close[t + HORIZON] against close[t] via a
-       plain forward shift — NOT a searchsorted/window-scan, since the
-       new target is a single future point, not "did it ever touch a
-       level within a window"
-    4. Drop the last HORIZON rows per pair, where the future close
-       needed for comparison doesn't exist yet (NaN, not zero-filled —
-       we don't fabricate an outcome for rows we genuinely don't know
-       yet)
-    5. Return one row per (pair, datetime) with a binary label
+    3. For each pair, compute:
+       - net_move[t]  = close[t+HORIZON] - close[t]        (forward shift)
+       - bull_count[t] = count of bullish candles (close > open) among
+                         the HORIZON candles at t+1 .. t+HORIZON
+       - bear_count[t] = count of bearish candles (close < open) among
+                         the same HORIZON candles
+    4. Classify each row:
+       - BUY (1)  if net_move  >=  MIN_MOVE_ATR_MULTIPLE * atr_fast[t]
+                  and bull_count >= MIN_CONFIRMING_CANDLES
+       - SELL (0) if net_move  <= -MIN_MOVE_ATR_MULTIPLE * atr_fast[t]
+                  and bear_count >= MIN_CONFIRMING_CANDLES
+       - otherwise: discard (NaN label, dropped)
+    5. Drop the last HORIZON rows per pair, where the future closes
+       and candles needed for the calculation don't exist yet (NaN,
+       not zero-filled — we don't fabricate an outcome for rows we
+       genuinely don't know yet)
+    6. Return one row per (pair, datetime) that received a real label
 
-    NO LOOK-AHEAD BIAS: target[t] is computed from close[t] and
-    close[t+HORIZON] only — both are already-realised prices by the
-    time this label would ever be used for scoring at t+HORIZON. The
-    label is deliberately NOT usable to predict anything at time t
-    itself (that's the model's job, using only data available up to
-    and including t) — this function only ever runs on historical
-    data where the future is already known, for training purposes.
+    NO LOOK-AHEAD BIAS: every quantity used (net_move, bull_count,
+    bear_count) is computed from close[t] and the HORIZON candles
+    strictly after t — all already-realised prices by the time this
+    label would ever be used for scoring at t+HORIZON. This function
+    only ever runs on historical data where the future is already
+    known, for training purposes.
 
     Args:
         prices_df: Full OHLC DataFrame [pair, datetime, open, high,
-                   low, close], one row per pair per weekly candle
+                   low, close, atr_fast, ...], one row per pair per
+                   daily candle. atr_fast must already be present
+                   (produced by features.py) — this function does not
+                   compute it.
 
     Returns:
         DataFrame with columns [pair, datetime, label], one row per
-        (pair, datetime) that has a valid HORIZON-candles-ahead close
-        to compare against. label is 1 (up) or 0 (down/flat).
+        (pair, datetime) that cleared either the BUY or SELL bar.
+        label is 1 (BUY) or 0 (SELL). Rows that were discarded (didn't
+        clear either bar) are simply absent, not present with a NaN
+        or third-class label.
     """
-    logger.info(f"Generating directional labels | HORIZON={HORIZON} weekly candles")
+    logger.info(
+        f"Generating directional labels | HORIZON={HORIZON} daily candles | "
+        f"min_move_atr_multiple={MIN_MOVE_ATR_MULTIPLE} | "
+        f"min_confirming_candles={MIN_CONFIRMING_CANDLES}/{HORIZON}"
+    )
 
     if prices_df.empty:
         logger.warning("label_direction: prices_df is empty")
         return pd.DataFrame(columns=["pair", "datetime", "label"])
 
+    if "atr_fast" not in prices_df.columns:
+        raise MLError(
+            "label_direction: prices_df is missing 'atr_fast' — this "
+            "column must be computed upstream by features.py "
+            "(_compute_atr(px, ATR_FAST_PERIOD)) before labelling. "
+            "This function does not compute ATR itself."
+        )
+
     prices_df = _normalise_datetime_column(prices_df, "prices_df")
 
     all_labels = []
+    total_discarded = 0
 
     for pair, group in prices_df.groupby("pair"):
         group = group.sort_values("datetime").reset_index(drop=True)
@@ -227,29 +287,72 @@ def label_direction(prices_df: pd.DataFrame) -> pd.DataFrame:
             )
             continue
 
-        future_close = group["close"].shift(-HORIZON)
+        close = group["close"]
+        open_ = group["open"]
+        atr_fast = group["atr_fast"]
 
-        # BUG FIX (caught in testing, not a style choice): comparing a
-        # plain float against NaN via `future_close > close` does NOT
-        # produce NaN for the missing rows — it silently evaluates to
-        # False, and casting that False to "Int64" afterward just gives
-        # 0, not <NA>. That meant the intended "drop the last HORIZON
-        # rows" behaviour never actually fired — every row got a label,
-        # including the ones with no real future close to compare
-        # against, silently mislabelling them as "down." Fixed by
-        # explicitly using .where() to force NaN wherever future_close
-        # itself is NaN, BEFORE the comparison, so the missing-ness is
-        # real and explicit rather than assumed to propagate on its own.
-        is_up = future_close > group["close"]
-        label = is_up.where(future_close.notna()).astype("Int64")
+        future_close = close.shift(-HORIZON)
+        net_move = future_close - close
+
+        # Per-candle bullish/bearish flags, aligned to their own row —
+        # shifted into place below so that, for row t, we can sum the
+        # flags over rows t+1 .. t+HORIZON.
+        is_bullish_candle = (close > open_)
+        is_bearish_candle = (close < open_)
+
+        bull_count = pd.Series(0, index=group.index, dtype="float64")
+        bear_count = pd.Series(0, index=group.index, dtype="float64")
+        for k in range(1, HORIZON + 1):
+            bull_count = bull_count.add(
+                is_bullish_candle.shift(-k).astype("float64"), fill_value=0
+            )
+            bear_count = bear_count.add(
+                is_bearish_candle.shift(-k).astype("float64"), fill_value=0
+            )
+
+        # BUG-PRONE PATTERN (see prior version's note): comparing floats
+        # against NaN silently evaluates comparisons to False rather
+        # than propagating NaN, which would let rows past the horizon
+        # (with no real future data) sneak in as false negatives/
+        # discards instead of being explicitly dropped. Guard explicitly
+        # via .notna() on future_close BEFORE combining conditions.
+        has_valid_future = future_close.notna()
+
+        buy_move_ok  = net_move >=  MIN_MOVE_ATR_MULTIPLE * atr_fast
+        sell_move_ok = net_move <= -MIN_MOVE_ATR_MULTIPLE * atr_fast
+
+        is_buy  = has_valid_future & buy_move_ok  & (bull_count >= MIN_CONFIRMING_CANDLES)
+        is_sell = has_valid_future & sell_move_ok & (bear_count >= MIN_CONFIRMING_CANDLES)
+
+        # A row cannot be both — buy_move_ok and sell_move_ok are
+        # mutually exclusive by construction (net_move can't be both
+        # >= a positive threshold and <= its negative). Rows matching
+        # neither are the discard case: no label at all.
+        label = pd.Series(np.nan, index=group.index, dtype="float64")
+        label = label.mask(is_buy, 1.0)
+        label = label.mask(is_sell, 0.0)
 
         pair_labels = pd.DataFrame({
             "pair"    : pair,
             "datetime": group["datetime"],
             "label"   : label,
         })
+
+        n_eligible = int(has_valid_future.sum())
+        n_labelled = int(label.notna().sum())
+        total_discarded += (n_eligible - n_labelled)
+
         pair_labels = pair_labels.dropna(subset=["label"])
         pair_labels["label"] = pair_labels["label"].astype(int)
+
+        if n_eligible > 0:
+            logger.debug(
+                f"{pair} | eligible={n_eligible} | labelled={n_labelled} | "
+                f"discarded={n_eligible - n_labelled} "
+                f"({(n_eligible - n_labelled) / n_eligible * 100:.1f}%)"
+            )
+        else:
+            logger.debug(f"{pair} | no eligible rows")
 
         all_labels.append(pair_labels)
 
@@ -259,13 +362,26 @@ def label_direction(prices_df: pd.DataFrame) -> pd.DataFrame:
 
     result = pd.concat(all_labels, ignore_index=True)
 
+    if result.empty:
+        # Every eligible row across every pair was discarded — a real,
+        # expected possibility under this filter (e.g. a uniformly
+        # choppy period), not necessarily a bug. Log plainly rather
+        # than dividing by zero.
+        logger.warning(
+            f"label_direction: {total_discarded} row(s) were eligible "
+            f"but ALL were discarded — no BUY/SELL labels produced "
+            f"this run."
+        )
+        return result
+
     pos = (result["label"] == 1).sum()
     neg = (result["label"] == 0).sum()
     logger.info(
         f"Directional labels generated | "
         f"Total: {len(result)} | "
-        f"Up (1): {pos} ({pos/len(result)*100:.1f}%) | "
-        f"Down (0): {neg} ({neg/len(result)*100:.1f}%)"
+        f"BUY (1): {pos} ({pos/len(result)*100:.1f}%) | "
+        f"SELL (0): {neg} ({neg/len(result)*100:.1f}%) | "
+        f"Discarded: {total_discarded}"
     )
 
     return result
