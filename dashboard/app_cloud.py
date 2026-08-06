@@ -387,12 +387,19 @@ else:
 
     for tab, basket_name in zip(basket_tabs, BASKETS.keys()):
         with tab:
-            basket_predictions = read_latest_prediction_results(basket=basket_name)
+            basket_predictions = read_latest_prediction_results(
+                basket=basket_name,
+                as_of_date=oldest_date.isoformat() if fetch_dates else None,
+            )
 
             if basket_predictions.empty:
+                date_note = f" for {oldest_date.isoformat()}" if fetch_dates else ""
                 st.info(
                     f"No predictions cleared the display threshold for "
-                    f"{basket_name} this run."
+                    f"{basket_name}{date_note}. This is a normal, honest "
+                    f"result — it means today's candle didn't produce a "
+                    f"high-confidence call for this basket, not a display "
+                    f"error."
                 )
                 continue
 
