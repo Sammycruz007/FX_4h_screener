@@ -372,63 +372,80 @@ def run_full_pipeline():
         else:
             outcome_records = []
             for _, pred_row in unevaluated.iterrows():
-                # pred_row["datetime"] comes back from Postgres (a
-                # TIMESTAMPTZ column, via read_unevaluated_predictions)
-                # already tz-aware — passing tz="UTC" to pd.Timestamp()
-                # on an already-tz-aware value raises "Cannot pass a
+                # pred_row["datetime"] now comes back as a plain Python
+                # datetime.date — prediction_results.datetime was
+                # migrated from TIMESTAMPTZ to DATE (see
+                # database_cloud.py's initialise_database migrations),
+                # since every value here was always midnight UTC
+                # anyway (a candle DATE, never a real time-of-day).
+                # psycopg2 maps a DATE column straight to
+                # datetime.date, so no tz_localize/tz_convert dance is
+                # needed here at all anymore — a plain date has no
+                # timezone to be aware or naive ABOUT. This eliminates
+                # the entire bug class that caused "Cannot pass a
                 # datetime or Timestamp with tzinfo with the tz
-                # parameter," which is exactly the error this caused.
-                # tz_localize("UTC") is only valid on NAIVE timestamps;
-                # an already-aware one needs tz_convert() instead (or,
-                # since everything in this project is UTC throughout,
-                # simply used as-is). This helper handles either input
-                # state without assuming which one it'll get — the same
-                # class of bug has hit this project twice before
-                # (engines/macro.py's macro index, and the continuation-
-                # lookup datetime comparison), so normalize explicitly
-                # here rather than adding a third ad-hoc assumption.
-                pred_datetime = pd.Timestamp(pred_row["datetime"])
-                if pred_datetime.tzinfo is None:
-                    pred_datetime = pred_datetime.tz_localize("UTC")
-                else:
-                    pred_datetime = pred_datetime.tz_convert("UTC")
+                # parameter" here, and the earlier engines/macro.py and
+                # continuation-lookup tz bugs elsewhere in this project
+                # — all three were the same root cause (candle dates
+                # stored/passed as full datetimes, sometimes tz-aware,
+                # sometimes not), now structurally impossible for this
+                # column.
+                pred_date = pred_row["datetime"]
+                if not isinstance(pred_date, _datetime.date):
+                    pred_date = pd.Timestamp(pred_date).date()
 
-                pred_date = pred_datetime.date()
                 valid_through = _add_business_days(pred_date, LABEL_FORWARD_PERIODS)
-                valid_through_ts = pd.Timestamp(valid_through, tz="UTC")
 
                 # Only evaluate predictions whose window has GENUINELY
                 # elapsed (today is after valid_through) — not ones
-                # still in-flight, which read_unevaluated_predictions'
-                # SQL already filters for, but double-checked here
-                # since valid_through is computed in Python, not SQL.
+                # still in-flight. read_unevaluated_predictions' SQL
+                # does NOT filter by expiry itself (see its docstring
+                # in database_cloud.py) — this is the actual, only
+                # place that check happens.
                 if today_date <= valid_through:
                     continue
 
                 pair_prices = working_df[working_df["pair"] == pred_row["pair"]].sort_values("datetime")
 
-                # working_df's datetime dtype isn't guaranteed to match
-                # pred_datetime/valid_through_ts's tz-awareness here —
-                # it comes from read_price_history() (a Storage/Parquet
-                # read), a different path than the TIMESTAMPTZ columns
-                # pred_row came from, so don't assume either state.
-                # Normalize whichever side needs it just before
-                # comparing, same pattern as pred_datetime above.
+                # working_df["datetime"] is the raw OHLC price history
+                # from read_price_history() (a Storage/Parquet read) —
+                # a DIFFERENT column than prediction_results.datetime,
+                # untouched by the DATE migration above, and likely
+                # still a real tz-aware timestamp (candles have an
+                # actual fetch/close moment, unlike a prediction's
+                # candle-date reference). Comparing a plain
+                # pred_date/valid_through (datetime.date) against this
+                # column needs pred_date/valid_through converted to
+                # match whatever working_df's dtype actually is, not
+                # the other way around — normalize once here, at the
+                # single remaining comparison point in this function
+                # that still spans the two different column types.
                 prices_dt = pair_prices["datetime"]
-                if prices_dt.dt.tz is None:
-                    comparison_pred_datetime     = pred_datetime.tz_localize(None)
-                    comparison_valid_through_ts  = valid_through_ts.tz_localize(None)
+                if pd.api.types.is_datetime64_any_dtype(prices_dt):
+                    if prices_dt.dt.tz is not None:
+                        pred_datetime_cmp     = pd.Timestamp(pred_date, tz=prices_dt.dt.tz)
+                        valid_through_cmp     = pd.Timestamp(valid_through, tz=prices_dt.dt.tz)
+                    else:
+                        pred_datetime_cmp     = pd.Timestamp(pred_date)
+                        valid_through_cmp     = pd.Timestamp(valid_through)
                 else:
-                    comparison_pred_datetime     = pred_datetime
-                    comparison_valid_through_ts  = valid_through_ts
+                    # working_df["datetime"] isn't a proper pandas
+                    # datetime dtype at all (e.g. plain objects/strings
+                    # from an unusual read path) — fall back to plain
+                    # date comparison, which pandas can still evaluate
+                    # correctly against date-like strings/objects.
+                    pred_datetime_cmp = pred_date
+                    valid_through_cmp = valid_through
 
-                price_at_prediction = pair_prices[prices_dt <= comparison_pred_datetime]
-                price_at_expiry     = pair_prices[prices_dt <= comparison_valid_through_ts]
+                price_at_prediction = pair_prices[prices_dt <= pred_datetime_cmp]
+                price_at_expiry     = pair_prices[prices_dt <= valid_through_cmp]
 
                 if price_at_prediction.empty or price_at_expiry.empty:
                     logger.warning(
                         f"  {pred_row['pair']}: insufficient price history to "
-                        f"evaluate outcome — skipping this run, will retry next run"
+                        f"evaluate outcome (need data through {valid_through.isoformat()}, "
+                        f"have through {prices_dt.max() if not prices_dt.empty else 'nothing'}) "
+                        f"— skipping this run, will retry next run"
                     )
                     continue
 
@@ -443,7 +460,7 @@ def run_full_pipeline():
                 outcome_records.append({
                     "pair"                : pred_row["pair"],
                     "basket"              : pred_row["basket"],
-                    "prediction_datetime" : pred_row["datetime"],
+                    "prediction_datetime" : pred_date.isoformat(),
                     "direction"           : pred_row["direction"],
                     "up_probability"      : float(pred_row["up_probability"]),
                     "valid_through_date"  : valid_through.isoformat(),

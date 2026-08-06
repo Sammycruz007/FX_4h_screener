@@ -493,9 +493,23 @@ else:
         display_outcomes["prediction_datetime"]
     ).dt.date
 
+    # Show CONFIDENCE, not raw up_probability — up_probability is
+    # always "probability of UP" regardless of which direction was
+    # actually predicted, so a DOWN call with up_probability=0.20
+    # reads as "20% confidence" when the model was actually 80%
+    # confident IN THE DOWN CALL. Same fix already applied to the
+    # continuation-label logic in run_pipeline_cloud.py — applying it
+    # here too so Live Tracking doesn't reintroduce the same
+    # misleading framing for outcomes specifically.
+    if "up_probability" in display_outcomes.columns and "direction" in display_outcomes.columns:
+        display_outcomes["confidence"] = display_outcomes.apply(
+            lambda row: row["up_probability"] if row["direction"] == "up" else 1 - row["up_probability"],
+            axis=1,
+        )
+
     outcome_cols = [
         "pair", "basket", "prediction_datetime", "direction",
-        "up_probability", "valid_through_date", "actual_close_change", "outcome",
+        "confidence", "valid_through_date", "actual_close_change", "outcome",
     ]
     outcome_cols = [c for c in outcome_cols if c in display_outcomes.columns]
 
@@ -504,7 +518,7 @@ else:
         return [f"background-color: {color}"] * len(row)
 
     st.dataframe(
-        display_outcomes[outcome_cols].style.apply(_highlight_outcome, axis=1),
+        display_outcomes[outcome_cols].style.apply(_highlight_outcome, axis=1).format({"confidence": "{:.2%}"}),
         use_container_width=True,
         hide_index=True,
     )

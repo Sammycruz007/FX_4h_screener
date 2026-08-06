@@ -133,7 +133,7 @@ def initialise_database() -> None:
         CREATE TABLE IF NOT EXISTS indicator_results (
             id                   SERIAL PRIMARY KEY,
             pair                 TEXT NOT NULL,
-            datetime             TIMESTAMPTZ NOT NULL,
+            datetime             DATE NOT NULL,
             adx_value            REAL,
             plus_di              REAL,
             minus_di             REAL,
@@ -153,7 +153,7 @@ def initialise_database() -> None:
         CREATE TABLE IF NOT EXISTS prediction_results (
             id                   SERIAL PRIMARY KEY,
             pair                 TEXT NOT NULL,
-            datetime             TIMESTAMPTZ NOT NULL,
+            datetime             DATE NOT NULL,
             basket               TEXT NOT NULL,
             up_probability       REAL NOT NULL,
             direction            TEXT NOT NULL,
@@ -189,7 +189,7 @@ def initialise_database() -> None:
         CREATE TABLE IF NOT EXISTS all_predictions_log (
             id             SERIAL PRIMARY KEY,
             pair           TEXT NOT NULL,
-            datetime       TIMESTAMPTZ NOT NULL,
+            datetime       DATE NOT NULL,
             basket         TEXT NOT NULL,
             up_probability REAL NOT NULL,
             direction      TEXT NOT NULL,
@@ -202,7 +202,7 @@ def initialise_database() -> None:
             id                  SERIAL PRIMARY KEY,
             pair                TEXT NOT NULL,
             basket              TEXT NOT NULL,
-            prediction_datetime TIMESTAMPTZ NOT NULL,
+            prediction_datetime DATE NOT NULL,
             direction           TEXT NOT NULL,
             up_probability      REAL NOT NULL,
             valid_through_date  DATE NOT NULL,
@@ -248,6 +248,29 @@ def initialise_database() -> None:
         # rerun indefinitely on every initialise_database() call.
         "ALTER TABLE prediction_results ADD COLUMN IF NOT EXISTS signal_status TEXT",
         "ALTER TABLE prediction_results ADD COLUMN IF NOT EXISTS previous_probability REAL",
+        # Convert candle-date columns from TIMESTAMPTZ to DATE on
+        # already-deployed tables — same "CREATE TABLE IF NOT EXISTS
+        # is a no-op against an existing table" issue as above, so an
+        # explicit ALTER is required here too, not just the schema
+        # change in the CREATE TABLE statements. USING datetime::date
+        # is safe here specifically because every value in these
+        # tables was always midnight UTC anyway (candle dates, not
+        # real timestamps) — this drops the time-of-day/tz component
+        # that was never meaningful, losing no information.
+        #
+        # THIS IS THE FIX for the recurring family of tz-aware vs.
+        # tz-naive comparison bugs this project hit repeatedly
+        # (engines/macro.py's driver index, the continuation-lookup
+        # comparison, and the STEP 8.5 "Cannot pass a datetime or
+        # Timestamp with tzinfo" crash) — a plain DATE has no
+        # timezone to be aware or naive ABOUT, so comparisons between
+        # these columns and Python's datetime.date objects (what
+        # _add_business_days already returns) now just work, with no
+        # tz_localize/tz_convert dance needed anywhere.
+        "ALTER TABLE indicator_results ALTER COLUMN datetime TYPE DATE USING datetime::date",
+        "ALTER TABLE prediction_results ALTER COLUMN datetime TYPE DATE USING datetime::date",
+        "ALTER TABLE all_predictions_log ALTER COLUMN datetime TYPE DATE USING datetime::date",
+        "ALTER TABLE prediction_outcomes ALTER COLUMN prediction_datetime TYPE DATE USING prediction_datetime::date",
     ]
 
     with get_connection() as conn:
@@ -588,10 +611,24 @@ def write_prediction_outcomes(records: list) -> int:
 
 def read_unevaluated_predictions(as_of_date: str) -> pd.DataFrame:
     """
-    Find predictions whose validity window has elapsed (valid_through_date
-    < as_of_date, i.e. genuinely expired, not just close to expiring) but
-    that don't have an outcome recorded yet — these are ready to be
-    scored against actual price data.
+    Find predictions with NO outcome recorded yet in prediction_outcomes
+    — candidates for evaluation, not yet filtered by whether their
+    validity window has actually expired.
+
+    IMPORTANT: this function does NOT filter by valid_through_date —
+    it can't, cleanly, in SQL alone, since valid_through_date isn't a
+    stored column here (it's derived from the prediction's date via
+    business-day arithmetic, which skips weekends — not a single plain
+    SQL date comparison). The as_of_date argument is accepted for
+    interface consistency but currently unused inside this function's
+    SQL; every row with no outcome yet comes back, expired or not. The
+    caller (run_pipeline_cloud.py's STEP 8.5) is responsible for
+    computing each row's valid_through_date via _add_business_days()
+    and skipping (continuing past) any row that hasn't actually
+    expired yet. This split was previously undocumented and looked
+    like a bug (a docstring here claimed date-filtering that was never
+    implemented) — now stated plainly so it isn't mistaken for one
+    again.
 
     Only looks at predictions that cleared the display threshold
     (prediction_results), since those are the only ones the live
@@ -600,13 +637,16 @@ def read_unevaluated_predictions(as_of_date: str) -> pd.DataFrame:
     outcome tracking.
 
     Args:
-        as_of_date: Today's date as 'YYYY-MM-DD' — predictions whose
-                   valid_through_date is before this are due for
-                   evaluation.
+        as_of_date: Accepted for interface consistency with the
+                   caller's naming, but not used in this function's
+                   SQL — see the note above. The real filtering by
+                   expiry happens in run_pipeline_cloud.py's STEP 8.5,
+                   row by row, after this function returns.
 
     Returns:
         DataFrame [pair, basket, datetime, direction, up_probability],
-        one row per prediction awaiting evaluation.
+        one row per unscored prediction — expired or not; the caller
+        filters further.
     """
     sql = """
         SELECT pr.pair, pr.basket, pr.datetime, pr.direction, pr.up_probability
@@ -697,7 +737,7 @@ def read_latest_prediction_results(
         if basket:
             sql = """
                 SELECT * FROM prediction_results
-                WHERE datetime::date = %s
+                WHERE datetime = %s
                   AND basket = %s
                 ORDER BY confidence DESC
             """
@@ -705,7 +745,7 @@ def read_latest_prediction_results(
         else:
             sql = """
                 SELECT * FROM prediction_results
-                WHERE datetime::date = %s
+                WHERE datetime = %s
                 ORDER BY confidence DESC
             """
             params = (as_of_date,)
