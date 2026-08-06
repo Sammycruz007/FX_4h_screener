@@ -372,8 +372,30 @@ def run_full_pipeline():
         else:
             outcome_records = []
             for _, pred_row in unevaluated.iterrows():
-                pred_date = pd.Timestamp(pred_row["datetime"]).date()
+                # pred_row["datetime"] comes back from Postgres (a
+                # TIMESTAMPTZ column, via read_unevaluated_predictions)
+                # already tz-aware — passing tz="UTC" to pd.Timestamp()
+                # on an already-tz-aware value raises "Cannot pass a
+                # datetime or Timestamp with tzinfo with the tz
+                # parameter," which is exactly the error this caused.
+                # tz_localize("UTC") is only valid on NAIVE timestamps;
+                # an already-aware one needs tz_convert() instead (or,
+                # since everything in this project is UTC throughout,
+                # simply used as-is). This helper handles either input
+                # state without assuming which one it'll get — the same
+                # class of bug has hit this project twice before
+                # (engines/macro.py's macro index, and the continuation-
+                # lookup datetime comparison), so normalize explicitly
+                # here rather than adding a third ad-hoc assumption.
+                pred_datetime = pd.Timestamp(pred_row["datetime"])
+                if pred_datetime.tzinfo is None:
+                    pred_datetime = pred_datetime.tz_localize("UTC")
+                else:
+                    pred_datetime = pred_datetime.tz_convert("UTC")
+
+                pred_date = pred_datetime.date()
                 valid_through = _add_business_days(pred_date, LABEL_FORWARD_PERIODS)
+                valid_through_ts = pd.Timestamp(valid_through, tz="UTC")
 
                 # Only evaluate predictions whose window has GENUINELY
                 # elapsed (today is after valid_through) — not ones
@@ -384,8 +406,24 @@ def run_full_pipeline():
                     continue
 
                 pair_prices = working_df[working_df["pair"] == pred_row["pair"]].sort_values("datetime")
-                price_at_prediction = pair_prices[pair_prices["datetime"] <= pd.Timestamp(pred_row["datetime"], tz="UTC")]
-                price_at_expiry = pair_prices[pair_prices["datetime"] <= pd.Timestamp(valid_through, tz="UTC")]
+
+                # working_df's datetime dtype isn't guaranteed to match
+                # pred_datetime/valid_through_ts's tz-awareness here —
+                # it comes from read_price_history() (a Storage/Parquet
+                # read), a different path than the TIMESTAMPTZ columns
+                # pred_row came from, so don't assume either state.
+                # Normalize whichever side needs it just before
+                # comparing, same pattern as pred_datetime above.
+                prices_dt = pair_prices["datetime"]
+                if prices_dt.dt.tz is None:
+                    comparison_pred_datetime     = pred_datetime.tz_localize(None)
+                    comparison_valid_through_ts  = valid_through_ts.tz_localize(None)
+                else:
+                    comparison_pred_datetime     = pred_datetime
+                    comparison_valid_through_ts  = valid_through_ts
+
+                price_at_prediction = pair_prices[prices_dt <= comparison_pred_datetime]
+                price_at_expiry     = pair_prices[prices_dt <= comparison_valid_through_ts]
 
                 if price_at_prediction.empty or price_at_expiry.empty:
                     logger.warning(
