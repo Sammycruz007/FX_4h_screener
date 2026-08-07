@@ -29,7 +29,9 @@ NEW LABEL DEFINITION (see FX_Directional_Model_Redesign spec):
 
        BUY (1)  if net_move >=  MIN_MOVE_ATR_MULTIPLE * atr_fast[t]
                 AND at least MIN_CONFIRMING_CANDLES of the H candles
-                in (t, t+H] close bullish (close > open)
+                in (t, t+H] close bullish (close[t+i] > close[t+i-1],
+                i.e. each candle makes net progress vs. the PRIOR
+                candle's close — not body direction/close > open)
 
        SELL (0) if net_move <= -MIN_MOVE_ATR_MULTIPLE * atr_fast[t]
                 AND at least MIN_CONFIRMING_CANDLES of the H candles
@@ -217,7 +219,9 @@ def label_direction(prices_df: pd.DataFrame) -> pd.DataFrame:
     2. Sort each pair's rows chronologically
     3. For each pair, compute:
        - net_move[t]  = close[t+HORIZON] - close[t]        (forward shift)
-       - bull_count[t] = count of bullish candles (close > open) among
+       - bull_count[t] = count of bullish candles (close[t+i] >
+                         close[t+i-1], i.e. net progress vs. the
+                         PRIOR candle's close) among
                          the HORIZON candles at t+1 .. t+HORIZON
        - bear_count[t] = count of bearish candles (close < open) among
                          the same HORIZON candles
@@ -288,17 +292,32 @@ def label_direction(prices_df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         close = group["close"]
-        open_ = group["open"]
         atr_fast = group["atr_fast"]
 
         future_close = close.shift(-HORIZON)
         net_move = future_close - close
 
-        # Per-candle bullish/bearish flags, aligned to their own row —
-        # shifted into place below so that, for row t, we can sum the
-        # flags over rows t+1 .. t+HORIZON.
-        is_bullish_candle = (close > open_)
-        is_bearish_candle = (close < open_)
+        # Per-candle bullish/bearish flags — CLOSE-TO-CLOSE vs. the
+        # PRIOR candle (close[t+i] > close[t+i-1]), not body direction
+        # (close > open). Changed per project decision, after the
+        # close>open version produced a much harsher discard rate than
+        # the spec anticipated (90.2% across the universe) and left
+        # one basket (cad) with too few OOS predictions to trust at
+        # all (n=1-4 across two ATR-threshold settings).
+        #
+        # WHY THIS IS A GENUINELY DIFFERENT SIGNAL, NOT JUST A RENAME:
+        # close>open asks "did THIS candle itself finish green,
+        # regardless of where the prior candle closed" — a candle can
+        # gap down, open low, still close above ITS OWN open, and
+        # count as bullish here even while closing BELOW the previous
+        # candle's close (a common shape during a choppy pullback).
+        # close-to-close instead asks "did price make net progress
+        # since the last close" — the more direct reading of
+        # "confirming candles" as originally discussed, and looser
+        # in practice (a candle only needs to beat the PRIOR CLOSE,
+        # not reverse its own intrabar dip and still finish green).
+        is_bullish_candle = (close > close.shift(1))
+        is_bearish_candle = (close < close.shift(1))
 
         bull_count = pd.Series(0, index=group.index, dtype="float64")
         bear_count = pd.Series(0, index=group.index, dtype="float64")
