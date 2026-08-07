@@ -49,7 +49,7 @@ ml:
   #   Otherwise: discard (no label) — replaces the old unconditional
   #   close(t+H) > close(t) label, which counted small, choppy net moves
   #   as a full BUY/SELL even when price reversed mid-window.
-  min_move_atr_multiple: 0.65
+  min_move_atr_multiple: 0.70
   min_confirming_candles: 2
   min_training_samples: 50
   model_retrain_days: 7
