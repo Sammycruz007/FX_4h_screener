@@ -13,40 +13,7 @@ DEPLOYMENT:
 - Streamlit Cloud looks for a file called streamlit_app.py at root
 - We create streamlit_app.py that simply imports this file
 
-WHAT REPLACES THE STOCK PROJECT'S MARKET PULSE / SECTOR HEALTH SECTIONS:
-   The stock dashboard had two separate sections: "Market Pulse" (3
-   gauges for SPY/QQQ/DIA) and "Sector Health" (11 tiles for sector
-   ETFs) — two distinct levels of market-context display, matching the
-   two-level waterfall in the stock scanner. FX collapses both into
-   ONE "Currency Strength" section: 8 gauges, one per major currency,
-   each showing that currency's CSI z-score (engines/csi.py's
-   csi_base_zscore/csi_quote_zscore — display-only, NOT a model
-   feature, added specifically so this section has something bounded
-   and gauge-readable to show, matching the existing SD-position gauge
-   style). There is no second, separate tier underneath this one — CSI
-   IS the per-currency-level reading; there's no natural "sector" layer
-   below it for FX the way there was for stocks. A small
-   csi_commodity_bloc callout sits alongside the grid, since that's a
-   genuinely distinct regime signal (AUD/NZD/CAD cohesion) that
-   doesn't belong to any single currency's own gauge.
 
-WHAT'S DROPPED FROM THE STOCK PROJECT'S DASHBOARD:
-   - Market Pulse section (SPY/QQQ/DIA) — replaced by Currency Strength
-   - Sector Health section (11 sector ETF tiles) — folded into Currency
-     Strength above; no second tier for FX
-   - get_market_sector_status import — that function doesn't exist in
-     scanner/screener.py; the whole waterfall/status concept it served
-     doesn't apply to FX (see screener.py's module docstring)
-   - GFT Watchlist section entirely, and its
-     read_latest_gft_watchlist_results import — a 15-stock evaluation-
-     account diagnostic with no FX equivalent, dropped per project
-     decision (see ml/signal_ranker.py's module docstring)
-   - volume_signal column from the Scanner Results table — no real
-     volume data exists for FX
-
-WHAT'S RENAMED:
-   - ticker -> pair, throughout
-   - "date" -> "datetime" for the last-run caption
 
 WHAT CHANGED IN THIS PASS — SECTION 2 IS A REDESIGN, NOT A RENAME:
    The project moved from a scanner-flagged-candidate design (LinReg +
@@ -176,23 +143,23 @@ from data.database_cloud import (
 # even uncached — the actual multiplier here was rerun frequency, not
 # per-query payload size.
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=43200)
 def _cached_read_latest_indicator_results():
     return read_latest_indicator_results()
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=43200)
 def _cached_get_last_fetch_dates_bulk():
     return get_last_fetch_dates_bulk()
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=43200)
 def _cached_read_latest_prediction_results(basket: str, as_of_date: Optional[str]):
     return read_latest_prediction_results(basket=basket, as_of_date=as_of_date)
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=43200)
 def _cached_read_prediction_outcomes(limit_days: int):
     return read_prediction_outcomes(limit_days=limit_days)
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=43200)
 def _cached_read_latest_model_metrics():
     return read_latest_model_metrics()
 
