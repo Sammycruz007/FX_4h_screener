@@ -103,6 +103,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 import pandas as pd
+from typing import Optional
 import plotly.graph_objects as go
 
 # =============================================================================
@@ -142,6 +143,59 @@ from data.database_cloud import (
     read_prediction_outcomes,
 )
 
+# ── Cached wrappers around every Supabase-hitting read ────────────────────
+# Added per project decision, after the Supabase org exceeded its Free
+# Plan egress quota (123% of 5GB) — root cause: Streamlit reruns this
+# ENTIRE script on every UI interaction (tab click, widget change,
+# auto-refresh), and every read below was hitting Supabase fresh each
+# time with zero caching, multiplying quickly across sessions (this
+# file alone makes 9 round-trips per rerun: 1 indicator read, 1
+# fetch_tracker read, 5 per-basket prediction reads inside the tab
+# loop, 1 outcomes read, 1 metrics read).
+#
+# TTL=3600 (1 hour), not the more commonly-suggested 600s (10 min):
+# every one of these tables is written to AT MOST once per day (the
+# pipeline runs once daily per daily_scan.yml's cron; models retrain
+# weekly per train_models.yml) — there is no scenario where refreshing
+# more often than once daily shows the user anything genuinely new,
+# so 1 hour is still far more responsive than the underlying data
+# ever changes, while cutting redundant same-session/same-day hits far
+# more aggressively than a 10-minute TTL would. If a manual pipeline
+# run is triggered mid-day, the dashboard picks it up within an hour
+# without needing a manual cache-clear (st.cache_data's built-in
+# "Clear cache" via the app menu is also always available for an
+# immediate refresh).
+#
+# NOTE: this file never reads the raw 254MB Parquet price-history file
+# at all (confirmed — no import of data.storage_cloud or
+# read_price_history anywhere in this dashboard) — that risk, if it
+# exists, is NOT in this file; these queries only ever hit the small,
+# already-processed Postgres tables (indicator_results,
+# prediction_results, fetch_tracker, prediction_outcomes,
+# model_metrics), which is what egress-heavy usage should look like
+# even uncached — the actual multiplier here was rerun frequency, not
+# per-query payload size.
+
+@st.cache_data(ttl=3600)
+def _cached_read_latest_indicator_results():
+    return read_latest_indicator_results()
+
+@st.cache_data(ttl=3600)
+def _cached_get_last_fetch_dates_bulk():
+    return get_last_fetch_dates_bulk()
+
+@st.cache_data(ttl=3600)
+def _cached_read_latest_prediction_results(basket: str, as_of_date: Optional[str]):
+    return read_latest_prediction_results(basket=basket, as_of_date=as_of_date)
+
+@st.cache_data(ttl=3600)
+def _cached_read_prediction_outcomes(limit_days: int):
+    return read_prediction_outcomes(limit_days=limit_days)
+
+@st.cache_data(ttl=3600)
+def _cached_read_latest_model_metrics():
+    return read_latest_model_metrics()
+
 # ── Initialise DB tables (safe — IF NOT EXISTS) ───────────────────────────────
 initialise_database()
 
@@ -170,7 +224,7 @@ with header_col2:
     )
 
 # ── Load indicator data ───────────────────────────────────────────────────────
-indicator_df = read_latest_indicator_results()
+indicator_df = _cached_read_latest_indicator_results()
 
 if indicator_df.empty:
     st.warning("No scan data yet. Pipeline has not run or Supabase is empty.")
@@ -186,23 +240,11 @@ if indicator_df.empty:
 # prediction remains valid (label_forward_periods business days ahead
 # on daily bars — see config.yaml's ml.label_forward_periods).
 import datetime as _datetime
-import yaml as _yaml
-
-def _get_label_forward_periods() -> int:
-    """Read ml.label_forward_periods from config.yaml directly, so this
-    caption never drifts out of sync with the value the pipeline and
-    labeller actually train/predict against (this constant was
-    previously hardcoded here and silently went stale when the config
-    value changed)."""
-    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
-    with open(config_path, "r") as f:
-        cfg = _yaml.safe_load(f)
-    return cfg["ml"]["label_forward_periods"]
 
 def _add_business_days(start_date: _datetime.date, n: int) -> _datetime.date:
     """Add n business days (Mon-Fri) to start_date, skipping weekends —
     matches FX market closure, consistent with how label_direction()
-    itself must skip non-trading days when building the N-day-ahead
+    itself must skip non-trading days when building the 2-day-ahead
     label this validity window is meant to mirror."""
     current = start_date
     added   = 0
@@ -212,10 +254,10 @@ def _add_business_days(start_date: _datetime.date, n: int) -> _datetime.date:
             added += 1
     return current
 
-LABEL_FORWARD_PERIODS = _get_label_forward_periods()  # from config.yaml's ml.label_forward_periods
-                            # (daily bars: "N business days ahead")
+LABEL_FORWARD_PERIODS = 2  # matches config.yaml's ml.label_forward_periods
+                            # (daily bars: "2 business days ahead")
 
-fetch_dates = get_last_fetch_dates_bulk()  # {pair: "YYYY-MM-DD"}
+fetch_dates = _cached_get_last_fetch_dates_bulk()  # {pair: "YYYY-MM-DD"}
 
 if not fetch_dates:
     st.caption("Latest candle date unavailable — fetch_tracker is empty.")
@@ -399,7 +441,7 @@ else:
 
     for tab, basket_name in zip(basket_tabs, BASKETS.keys()):
         with tab:
-            basket_predictions = read_latest_prediction_results(
+            basket_predictions = _cached_read_latest_prediction_results(
                 basket=basket_name,
                 as_of_date=oldest_date.isoformat() if fetch_dates else None,
             )
@@ -469,7 +511,7 @@ st.caption(
     "the original backtest metrics shown under Model Health below."
 )
 
-outcomes_df = read_prediction_outcomes(limit_days=30)
+outcomes_df = _cached_read_prediction_outcomes(limit_days=30)
 
 if outcomes_df.empty:
     st.info(
@@ -542,7 +584,7 @@ else:
 
 st.header("Model Health")
 
-metrics = read_latest_model_metrics()
+metrics = _cached_read_latest_model_metrics()
 
 if metrics.empty:
     st.info("ML models not trained yet.")
