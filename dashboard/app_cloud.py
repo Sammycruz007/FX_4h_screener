@@ -143,23 +143,23 @@ from data.database_cloud import (
 # even uncached — the actual multiplier here was rerun frequency, not
 # per-query payload size.
 
-@st.cache_data(ttl=43200)
+@st.cache_data(ttl=18000)
 def _cached_read_latest_indicator_results():
     return read_latest_indicator_results()
 
-@st.cache_data(ttl=43200)
+@st.cache_data(ttl=18000)
 def _cached_get_last_fetch_dates_bulk():
     return get_last_fetch_dates_bulk()
 
-@st.cache_data(ttl=43200)
+@st.cache_data(ttl=18000)
 def _cached_read_latest_prediction_results(basket: str, as_of_date: Optional[str]):
     return read_latest_prediction_results(basket=basket, as_of_date=as_of_date)
 
-@st.cache_data(ttl=43200)
+@st.cache_data(ttl=18000)
 def _cached_read_prediction_outcomes(limit_days: int):
     return read_prediction_outcomes(limit_days=limit_days)
 
-@st.cache_data(ttl=43200)
+@st.cache_data(ttl=18000)
 def _cached_read_latest_model_metrics():
     return read_latest_model_metrics()
 
