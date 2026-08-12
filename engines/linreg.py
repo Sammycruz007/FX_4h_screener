@@ -1,45 +1,70 @@
 """
 engines/linreg.py
------------------
-Linear Regression engine for the Stock Scanner pipeline.
+------------------
+Single-pair 5-minute LinReg slope confirmation — the execution-filter
+gate for the FX directional pipeline.
 
 LOGICAL FLOW:
 ─────────────
-This engine runs on every ticker that passed Stage 1 filter.
-For each ticker it does the following:
+This is NOT the multi-leg (stock + sector ETF + market indices) design
+from the stock-screener reference project this was adapted from. This
+project's execution filter is single-pair only: when Stage 1's daily
+model emits a BUY or SELL for a pair, this engine fits a LinReg channel
+on that SAME pair's fresh 5-minute intraday closes and checks whether
+the slope agrees with the model's direction.
+
+    Model says BUY  -> require an UP slope on the 5-min LinReg
+    Model says SELL -> require a DOWN slope on the 5-min LinReg
+    Disagreement (or missing/insufficient data) -> the signal is
+    dropped entirely — never written to Supabase, never shown on the
+    dashboard (see run_pipeline_cloud.py, which calls this right after
+    predictions are generated and before anything is persisted).
+
+DATA WINDOW:
+   A full month of 5-minute bars (execution_filter.fetch_days) is
+   fetched fresh into memory for the pair being checked — never
+   persisted, this is a point-in-time confirmation check, not a stored
+   feature. Of that month's worth of bars, only the most recent
+   execution_filter.linreg_period (1600) closes are actually used to
+   fit the regression line — the rest is headroom so the fit always
+   has a full window even accounting for weekend/holiday gaps in FX
+   trading hours, not a lookback the regression itself consumes.
 
 STEP 1 — Fit the Linear Regression line:
-   Using the last 200 closing prices, we fit a straight line
-   through the data using least squares regression (scipy).
-   This line represents the "fair value" trend of the stock.
-   The slope of this line tells us the trend direction.
+   Using the last linreg_period (1600) 5-minute closes, fit a straight
+   line through the data using least squares regression (scipy). The
+   slope of this line is the short-term trend direction.
 
-STEP 2 — Compute Standard Deviation bands:
-   We measure how far prices typically deviate from the LinReg line.
-   Using the residuals (actual price minus LinReg value at each point),
-   we compute the standard deviation of those residuals.
-   Then we add/subtract 1x, 2x, 3x that standard deviation
-   to get the upper and lower bands around the LinReg line.
+STEP 2 — Normalise the slope:
+   Raw slope is in price units per candle — not meaningfully
+   comparable across pairs at very different price scales (e.g.
+   EURUSD ~1.08 vs USDJPY ~150). Dividing by the current close gives a
+   percentage slope. This engine only ever evaluates one pair at a
+   time (no cross-pair comparison happens here), but normalising is
+   kept anyway for consistency with how slope is reported elsewhere in
+   this project, and because it costs nothing.
 
 STEP 3 — Determine slope direction:
-   If the LinReg slope is positive → uptrend → long bias
-   If the LinReg slope is negative → downtrend → short bias
-   Slope is normalised by price level so it's comparable across stocks.
+   Positive slope -> up. Negative slope -> down. That's the entire
+   gate — no SD-band / entry-zone logic. The stock-screener reference
+   project's "where does price sit relative to the bands" pullback
+   check doesn't apply here; this project's rule is simple direction
+   agreement, nothing more.
 
-STEP 4 — Determine price SD position:
-   We calculate exactly WHERE the current price sits relative
-   to the bands. e.g. -1.8 means price is 1.8 standard deviations
-   BELOW the LinReg line. +2.3 means 2.3 SDs ABOVE.
-   This single number tells the scanner exactly which zone price is in.
+STEP 4 — check_direction_agreement():
+   Given the model's predicted direction ("BUY" or "SELL") and this
+   engine's LinReg result for that same pair, returns whether the
+   5-min slope agrees — this project's actual pass/fail verdict.
 
-STEP 5 — Package results:
-   Return a clean dict with all computed values ready to be
-   written to the indicator_results table in SQLite.
-
-WHY SCIPY OVER PANDAS-TA:
-   pandas-ta has a linreg function but it only returns the line values.
-   We need the residuals to compute our own SD bands exactly as
-   we want them. scipy gives us full control over the regression.
+NOT INCLUDED HERE (dropped vs. both reference projects it was adapted
+from):
+  - Sector ETF / market-index legs — this gate is single-pair only,
+    there is no FX equivalent of "sector" or "market index" here.
+  - SD bands / price_sd_position — no entry-zone concept in this
+    project's rule, only slope-direction agreement.
+  - compute_linreg_series() / run_linreg_engine() batch runner — this
+    engine is called once per Stage-1-qualifying pair (never a full-
+    universe batch) and has no dashboard-charting requirement.
 """
 
 import numpy as np
@@ -64,241 +89,173 @@ def _load_config() -> dict:
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
-config     = _load_config()
-LINREG_CFG = config["linreg"]
+config   = _load_config()
+EXEC_CFG = config["execution_filter"]
 
-PERIOD   = LINREG_CFG["period"]       # 500 candles
-STD_DEVS = LINREG_CFG["std_devs"]     # [1, 2, 3]
+PERIOD = EXEC_CFG["linreg_period"]   # 1600 x 5-min bars used to fit the line
+
+if PERIOD < 3:
+    raise EngineError(
+        f"execution_filter.linreg_period={PERIOD} is invalid — need at "
+        f"least 3 candles for a meaningful regression (the current "
+        f"design uses 1600)."
+    )
 
 
 # =============================================================================
 # CORE LINREG CALCULATION
-# This is the mathematical heart of the engine.
 # =============================================================================
 
 def _compute_linreg(closes: np.ndarray) -> dict:
     """
-    Fit a linear regression line through an array of closing prices
-    and compute standard deviation bands around it.
+    Fit a linear regression line through an array of 5-minute closing
+    prices and determine its slope direction.
 
     MATHS:
-    - x = [0, 1, 2, ..., N-1] — time indices
+    - x = [0, 1, ..., N-1] — candle position (not timestamp — every
+      candle is treated as equally spaced, which is what makes slope
+      meaningful as a single number at all)
     - y = closing prices
-    - We fit: y = slope * x + intercept  (least squares)
-    - residuals = y - y_fitted  (how far each price deviates from the line)
-    - std_dev = standard deviation of residuals
-    - bands = y_fitted ± (n * std_dev) for n in [1, 2, 3]
+    - Fit: y = slope * x + intercept (least squares)
 
     Args:
-        closes: numpy array of closing prices, oldest first
+        closes: numpy array of closing prices, oldest first, length PERIOD
 
     Returns:
-        Dict with linreg_value, slope, std_dev, and all band values
-        for the MOST RECENT candle (last value in the array)
-    """
-
-    n = len(closes)
-    x = np.arange(n)  # Time indices: 0, 1, 2, ..., 199
-
-    # ── Step 1: Fit linear regression ────────────────────────────────────────
-    # scipy.stats.linregress returns slope, intercept, r_value, p_value, stderr
-    slope, intercept, r_value, p_value, std_err = stats.linregress(x, closes)
-
-    # ── Step 2: Compute fitted values (the LinReg line itself) ───────────────
-    # y_fitted[i] = slope * i + intercept  for each time index i
-    y_fitted = slope * x + intercept
-
-    # ── Step 3: Compute residuals ─────────────────────────────────────────────
-    # How far each actual price deviates from the fitted line
-    residuals = closes - y_fitted
-
-    # ── Step 4: Compute standard deviation of residuals ───────────────────────
-    # This is the "width" of typical price deviation from the LinReg line
-    n_1= len(residuals)
-    std_dev = np.sqrt(np.sum(residuals**2) / (n_1 - 2))  # Sample std dev
-
-    # ── Step 5: Get values for the MOST RECENT candle ─────────────────────────
-    # We only care about where the line and bands sit TODAY (last candle)
-    current_linreg = y_fitted[-1]
-    current_close  = closes[-1]
-
-    # ── Step 6: Compute SD bands for the current candle ───────────────────────
-    bands = {}
-    for sd in STD_DEVS:
-        bands[f"sd{sd}_upper"] = current_linreg + (sd * std_dev)
-        bands[f"sd{sd}_lower"] = current_linreg - (sd * std_dev)
-
-    # ── Step 7: Compute where current price sits (SD position) ────────────────
-    # Positive = above LinReg, Negative = below LinReg
-    # e.g. -1.8 means price is 1.8 SDs below the LinReg line
-    if std_dev > 0:
-        price_sd_position = (current_close - current_linreg) / std_dev
-    else:
-        price_sd_position = 0.0  # Avoid division by zero on flat price
-
-    # ── Step 8: Normalise slope for comparability across stocks ───────────────
-    # Raw slope is in price units (e.g. $0.05/day for a $50 stock)
-    # Dividing by current price gives a percentage slope
-    # This lets us compare slope steepness between a $10 and $500 stock
-    normalised_slope = slope / current_close if current_close > 0 else slope
-
-    return {
-        "linreg_value"      : round(current_linreg, 4),
-        "linreg_slope"      : round(normalised_slope, 6),
-        "linreg_slope_up"   : 1 if slope > 0 else 0,
-        "std_dev"           : round(std_dev, 4),
-        "price_sd_position" : round(price_sd_position, 4),
-        **{k: round(v, 4) for k, v in bands.items()},  # sd1_upper, sd1_lower, etc.
-    }
-
-
-# =============================================================================
-# FULL SERIES LINREG LINE
-# Used for charting the SPY/QQQ/DIA Plotly charts on the dashboard.
-# Returns the entire LinReg line and bands for all candles — not just the last.
-# =============================================================================
-
-def compute_linreg_series(closes: np.ndarray) -> pd.DataFrame:
-    """
-    Compute the full LinReg line and SD bands for all candles.
-    Used exclusively for dashboard charting of SPY, QQQ, DIA.
-
-    For the scanner (individual stocks), we only need the latest
-    candle values — use compute_linreg_latest() instead.
-
-    Args:
-        closes: numpy array of closing prices, oldest first
-
-    Returns:
-        DataFrame with columns:
-        [linreg, sd1_upper, sd1_lower, sd2_upper, sd2_lower, sd3_upper, sd3_lower]
-        One row per candle in the input array.
+        Dict with linreg_value, linreg_slope (normalised), and
+        linreg_slope_up (bool) — all for the MOST RECENT candle
     """
     n = len(closes)
     x = np.arange(n)
 
-    slope, intercept, _, _, _ = stats.linregress(x, closes)
-    y_fitted  = slope * x + intercept
-    residuals = closes - y_fitted
-    n_1= len(residuals)
-    std_dev   = np.sqrt(np.sum(residuals**2) / (n_1 - 2))
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, closes)
 
-    # Build a DataFrame with the full line and all bands
-    result = pd.DataFrame({"linreg": y_fitted})
+    y_fitted       = slope * x + intercept
+    current_linreg = y_fitted[-1]
+    current_close  = closes[-1]
 
-    for sd in STD_DEVS:
-        result[f"sd{sd}_upper"] = y_fitted + (sd * std_dev)
-        result[f"sd{sd}_lower"] = y_fitted - (sd * std_dev)
+    # Normalise slope by price level — see module docstring's STEP 2.
+    normalised_slope = slope / current_close if current_close > 0 else slope
 
-    return result.round(4)
+    return {
+        "linreg_value"   : round(float(current_linreg), 6),
+        "linreg_slope"   : round(float(normalised_slope), 8),
+        "linreg_slope_up": bool(slope > 0),
+    }
 
 
 # =============================================================================
-# PER-TICKER ENTRY POINT
-# Called by the scanner for each ticker in the filtered universe.
-# Wrapped with @graceful so one bad ticker never crashes the pipeline.
+# PER-PAIR ENTRY POINT
+# Called once per Stage-1-qualifying pair by run_pipeline_cloud.py, right
+# after a BUY/SELL prediction is generated and before anything is written
+# to Supabase. Wrapped with @graceful so a bad/missing intraday fetch for
+# one pair never crashes the rest of the run.
 # =============================================================================
 
 @graceful(default_return=None, exceptions=(Exception,), log_level="warning")
 def compute_linreg_latest(
-    ticker : str,
-    df     : pd.DataFrame,
-    date   : str,
+    pair : str,
+    df   : pd.DataFrame,
 ) -> Optional[dict]:
     """
-    Compute LinReg values for the most recent candle of a single ticker.
-    This is what the Airflow pipeline calls per ticker.
-
-    FLOW:
-    1. Validate we have enough data (need at least PERIOD candles)
-    2. Extract the last PERIOD closing prices
-    3. Run _compute_linreg() to get all values
-    4. Package into a flat dict ready for database insertion
-    5. Return dict (or None if anything fails — @graceful handles that)
+    Compute the 5-minute LinReg slope for the most recent candle of a
+    single FX pair.
 
     Args:
-        ticker : Ticker symbol e.g. 'AAPL'
-        df     : Full OHLCV DataFrame for this ticker, sorted date ascending
-        date   : Today's date string YYYY-MM-DD (for database keying)
+        pair : Pair symbol e.g. 'EURUSD'
+        df   : 5-minute OHLC DataFrame for this pair, sorted datetime
+               ascending, fetched fresh and in-memory — a month's
+               worth of bars, comfortably more than PERIOD (see module
+               docstring's DATA WINDOW section). Never persisted.
 
     Returns:
-        Dict with all LinReg values for this ticker today, or None on failure
+        Dict with pair / linreg_value / linreg_slope / linreg_slope_up
+        for this pair, or None on failure / insufficient data
+        (@graceful handles exceptions; the explicit length check below
+        handles "ran but not enough rows")
     """
-
-    # ── Step 1: Check we have enough candles ─────────────────────────────────
     if len(df) < PERIOD:
-        logger.warning(f"{ticker} | Only {len(df)} rows — need {PERIOD}+ for LinReg")
+        logger.warning(f"{pair} | Only {len(df)} 5-min rows — need {PERIOD}+ for LinReg")
         return None
-    # ── Step 2: Extract the last PERIOD closing prices as numpy array ─────────
+
     closes = df["close"].values[-PERIOD:]
 
-    # ── Step 3: Run the core LinReg calculation ───────────────────────────────
-    linreg_values = _compute_linreg(closes)
-
-    # ── Step 4: Add ticker and date for database insertion ────────────────────
     result = {
-        "ticker" : ticker,
-        "date"   : date,
-        **linreg_values,
+        "pair": pair,
+        **_compute_linreg(closes),
     }
 
     logger.debug(
-        f"{ticker} | LinReg: {result['linreg_value']} | "
-        f"Slope: {'UP' if result['linreg_slope_up'] else 'DOWN'} | "
-        f"SD Position: {result['price_sd_position']}"
+        f"{pair} | LinReg: {result['linreg_value']} | "
+        f"Slope: {'UP' if result['linreg_slope_up'] else 'DOWN'}"
     )
 
     return result
 
 
 # =============================================================================
-# BATCH RUNNER
-# Runs the LinReg engine across all tickers in the filtered universe.
-# Returns a DataFrame ready to be written to indicator_results table.
+# DIRECTION AGREEMENT CHECK — the actual pass/fail gate
 # =============================================================================
 
-def run_linreg_engine(
-    tickers_data : dict[str, pd.DataFrame],
-    date         : str,
-) -> pd.DataFrame:
+def check_direction_agreement(
+    model_direction : str,
+    linreg_result   : Optional[dict],
+) -> dict:
     """
-    Run LinReg computation for all tickers in the filtered universe.
+    Given Stage 1's predicted direction for a pair and this engine's
+    5-min LinReg result for that SAME pair, determine whether the
+    signal is confirmed.
 
-    FLOW:
-    1. Iterate over each ticker and its OHLCV DataFrame
-    2. Call compute_linreg_latest() for each
-    3. Collect results — skipping any tickers that returned None
-    4. Return combined DataFrame for bulk database write
+    RULE (see conversation — deliberate, project-specific, and
+    deliberately simpler than the stock-screener reference project's
+    multi-leg + SD-zone design):
+    - model_direction == "BUY"  requires linreg_slope_up == True
+    - model_direction == "SELL" requires linreg_slope_up == False
+    - A missing/None linreg_result (intraday fetch failed, or
+      insufficient 5-min history) fails the candidate outright.
 
     Args:
-        tickers_data : Dict mapping ticker → OHLCV DataFrame
-                       e.g. {"AAPL": df_aapl, "TSLA": df_tsla, ...}
-        date         : Today's date string YYYY-MM-DD
+        model_direction: "BUY" or "SELL" — Stage 1's call for this pair
+        linreg_result  : compute_linreg_latest() output for this SAME
+                         pair, or None
 
     Returns:
-        DataFrame with one row per ticker containing all LinReg columns
+        Dict with:
+          - "passed"          : bool
+          - "reason"          : short string explaining a fail (for
+                                 logging/audit), None if passed
+          - "linreg_slope_up" : bool or None
     """
-    logger.info(f"LinReg engine starting | {len(tickers_data)} tickers | Date: {date}")
+    if model_direction not in ("BUY", "SELL"):
+        return {
+            "passed"          : False,
+            "reason"          : f"unrecognised model_direction={model_direction!r}",
+            "linreg_slope_up" : None,
+        }
 
-    results = []
-    failed  = 0
+    if linreg_result is None:
+        return {
+            "passed"          : False,
+            "reason"          : (
+                "missing LinReg result (5-min fetch failed or "
+                "insufficient intraday history)"
+            ),
+            "linreg_slope_up" : None,
+        }
 
-    for ticker, df in tickers_data.items():
-        result = compute_linreg_latest(ticker, df, date)
+    slope_up = linreg_result["linreg_slope_up"]
 
-        if result is not None:
-            results.append(result)
-        else:
-            failed += 1
+    if model_direction == "BUY" and slope_up:
+        return {"passed": True, "reason": None, "linreg_slope_up": slope_up}
 
-    logger.info(
-        f"LinReg engine complete | "
-        f"Computed: {len(results)} | "
-        f"Skipped: {failed}"
-    )
+    if model_direction == "SELL" and not slope_up:
+        return {"passed": True, "reason": None, "linreg_slope_up": slope_up}
 
-    if not results:
-        logger.warning("LinReg engine: No results produced")
-        return pd.DataFrame()
-
-    return pd.DataFrame(results)
+    return {
+        "passed"          : False,
+        "reason"          : (
+            f"model_direction={model_direction} but 5-min LinReg slope "
+            f"is {'UP' if slope_up else 'DOWN'} — disagreement"
+        ),
+        "linreg_slope_up" : slope_up,
+    }
