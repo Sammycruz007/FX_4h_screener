@@ -49,12 +49,30 @@ ml:
   #   Otherwise: discard (no label) — replaces the old unconditional
   #   close(t+H) > close(t) label, which counted small, choppy net moves
   #   as a full BUY/SELL even when price reversed mid-window.
-  min_move_atr_multiple: 0.65
+  min_move_atr_multiple: 0.8
   min_confirming_candles: 2
   min_training_samples: 50
   model_retrain_days: 7
   # Backfill every day, no skipping.
   backfill_stride: 1
+
+execution_filter:
+  # Post-model, pre-write confirmation gate (see engines/linreg.py and
+  # run_pipeline_cloud.py). When Stage 1's daily model emits a BUY or
+  # SELL for a pair, a fresh month of 5-minute intraday closes for that
+  # SAME pair is fetched in memory, a LinReg line is fit over the most
+  # recent linreg_period of them, and the signal only survives if the
+  # slope agrees with the model's direction (BUY needs an up-slope,
+  # SELL needs a down-slope). A disagreeing signal is dropped entirely
+  # — never written to Supabase, never shown on the dashboard.
+  fetch_interval: "5m"
+  # ~1 month of 5-min bars, fetched fresh and never persisted. This is
+  # headroom for the fit below, not itself the regression window — see
+  # linreg_period.
+  fetch_days: 30
+  # Number of most-recent 5-min closes actually used to fit the LinReg
+  # line/slope.
+  linreg_period: 1600
 
 scheduler:
   # 
