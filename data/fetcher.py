@@ -126,6 +126,16 @@ FETCH_INTERVAL   = FETCHER_CFG["fetch_interval"]        # "1wk" — native weekl
 
 MACRO_DRIVERS    = MACRO_CFG["drivers"]   # {"DXY": {"yf_ticker": ..., "storage_symbol": ...}, ...}
 
+# execution_filter — the 5-min LinReg execution gate's OWN fetch
+# settings (see engines/linreg.py). Deliberately separate from
+# FETCH_INTERVAL/HISTORICAL_DAYS above, which govern the persisted
+# Weekly-bar pipeline this file otherwise exists for — the intraday
+# fetch below is never written to storage at all (see
+# fetch_intraday_linreg_data()'s docstring).
+EXEC_FILTER_CFG      = config["execution_filter"]
+EXEC_FETCH_INTERVAL  = EXEC_FILTER_CFG["fetch_interval"]   # "5m"
+EXEC_FETCH_DAYS      = EXEC_FILTER_CFG["fetch_days"]       # 30
+
 
 # =============================================================================
 # FIXED FX UNIVERSE
@@ -572,6 +582,113 @@ def to_pair_dict(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
     logger.debug(f"to_pair_dict: reshaped {len(df)} rows into {len(pair_dict)} pairs")
     return pair_dict
+
+
+# =============================================================================
+# SINGLE-PAIR INTRADAY FETCH — execution filter only, NEVER PERSISTED
+# =============================================================================
+# Everything above this section exists to build up Supabase's permanent
+# Weekly-bar price history (fetch -> smart_fetch -> write_raw_prices).
+# This function is deliberately outside that chain: engines/linreg.py's
+# execution-filter gate needs a fresh month of 5-minute bars for ONE
+# pair at the moment a BUY/SELL candidate is being confirmed — computed
+# in memory, used once for that single gate decision, then discarded.
+# It never calls write_raw_prices, never touches Supabase Storage or
+# SQLite, and has no smart_fetch-style incremental/full-fetch distinction
+# (there is nothing to be incremental FROM — every call starts fresh).
+
+@retry(
+    attempts      = RETRY_ATTEMPTS,
+    delay_seconds = RETRY_DELAY,
+    exceptions    = (DataFetchError, Exception),
+)
+def fetch_intraday_linreg_data(pair: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch a month's worth of 5-minute OHLC bars for a single FX pair,
+    in-memory only. Feeds engines/linreg.py's compute_linreg_latest()
+    directly — never written to Supabase/SQLite, this data has no
+    reason to outlive the single gate check it's fetched for.
+
+    YFINANCE CONSTRAINT: intraday intervals under 1 day (5m included)
+    are capped by yfinance at the last 60 calendar days of history,
+    regardless of what's requested — an exchange/provider-side limit,
+    not a choice this project made. execution_filter.fetch_days (30)
+    sits comfortably inside that cap.
+
+    Args:
+        pair: Plain FX pair name, e.g. "EURUSD" (NOT the yfinance
+              '=X'-suffixed ticker — that conversion happens here, same
+              convention as get_full_universe() elsewhere in this file)
+
+    Returns:
+        DataFrame with columns [pair, datetime, open, high, low,
+        close], sorted datetime ascending, or None if the fetch fails
+        or returns unusable data (@retry handles transient failures;
+        this returns None if the fetch still comes back empty/invalid
+        after all retry attempts are exhausted)
+    """
+    ticker        = f"{pair}=X"
+    local_session = curl_requests.Session(impersonate="chrome")
+
+    try:
+        raw = yf.download(
+            ticker,
+            period      = f"{EXEC_FETCH_DAYS}d",
+            interval    = EXEC_FETCH_INTERVAL,   # "5m"
+            auto_adjust = True,
+            progress    = False,
+            threads     = False,
+            session     = local_session,
+        )
+
+        local_session.close()
+
+        if raw.empty:
+            logger.warning(
+                f"{ticker} | LinReg intraday fetch: yfinance returned "
+                f"empty DataFrame"
+            )
+            return None
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        raw.columns = [c.lower() for c in raw.columns]
+
+        required = ["open", "high", "low", "close"]
+        missing  = [c for c in required if c not in raw.columns]
+        if missing:
+            logger.warning(
+                f"{ticker} | LinReg intraday fetch: missing columns {missing}"
+            )
+            return None
+
+        df = raw[required].copy()
+
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+
+        df["pair"]     = pair
+        df["datetime"] = df.index
+        df             = df.reset_index(drop=True)
+        df             = df.sort_values("datetime").reset_index(drop=True)
+
+        if not validate_dataframe(df, pair, required, min_rows=50):
+            return None
+
+        df = df.dropna(subset=required)
+        df = df[df["close"] > 0]
+
+        logger.debug(
+            f"{ticker} | LinReg intraday fetch | {len(df)} 5-min rows "
+            f"over the last {EXEC_FETCH_DAYS} days"
+        )
+        return df
+
+    except Exception as e:
+        raise DataFetchError(f"{ticker} LinReg intraday fetch failed: {e}") from e
 
 
 # =============================================================================
