@@ -78,7 +78,13 @@ from datetime import datetime, timezone
 import pandas as pd
 import yaml
 
-from data.fetcher import get_full_universe, smart_fetch, smart_fetch_macro, to_pair_dict
+from data.fetcher import (
+    get_full_universe,
+    smart_fetch,
+    smart_fetch_macro,
+    to_pair_dict,
+    fetch_intraday_linreg_data,
+)
 from data.database_cloud import (
     initialise_database,
     write_indicator_results,
@@ -94,6 +100,7 @@ from engines.adx import compute_adx_latest
 from engines.csi import run_csi_engine
 from engines.candlestick import compute_raw_pattern_flags
 from engines.macro import get_macro_features_for_basket
+from engines.linreg import compute_linreg_latest, check_direction_agreement
 
 from ml.signal_ranker import predict_direction, load_directional_model
 
@@ -618,6 +625,70 @@ def run_full_pipeline():
         logger.info(
             f"Top display predictions:\n"
             f"{display_df[['pair','basket','direction','confidence','signal_status']].to_string(index=False)}"
+        )
+
+    # ── [STEP 9.9] Execution filter — 5-min LinReg slope confirmation ───────
+    # See engines/linreg.py's module docstring and the conversation this
+    # was designed in. Applied ONLY to display_df (the threshold-clearing
+    # candidates about to be written to prediction_results / shown on the
+    # dashboard) — NOT to predictions_df / write_all_predictions_log above,
+    # which is deliberately an unfiltered audit trail (see its own comment)
+    # that continuation/flip lookups depend on seeing every prediction,
+    # gated or not.
+    #
+    # For each display_df candidate: fetch a fresh month of 5-min bars for
+    # that SAME pair (in-memory only, never persisted — see
+    # fetch_intraday_linreg_data's docstring), fit a LinReg line over the
+    # most recent linreg_period closes, and require the slope to agree
+    # with the model's direction (up -> BUY, down -> SELL). A candidate
+    # that disagrees, or whose intraday fetch fails/has insufficient
+    # history, is DROPPED — never written anywhere, never shown.
+    #
+    # predictions_df's "direction" values are literal "up"/"down" (the
+    # live-prediction convention used throughout this file, including
+    # outcome evaluation above) — check_direction_agreement() expects
+    # "BUY"/"SELL" (the training-label convention from ml/labeller.py), so
+    # the mapping happens right here at the call site rather than changing
+    # either established convention.
+    if not display_df.empty:
+        logger.info(
+            f"\n[STEP 9.9] Running 5-min LinReg execution filter on "
+            f"{len(display_df)} candidate(s)..."
+        )
+
+        _DIRECTION_TO_MODEL_CALL = {"up": "BUY", "down": "SELL"}
+
+        def _passes_execution_filter(row) -> bool:
+            pair = row["pair"]
+            model_direction = _DIRECTION_TO_MODEL_CALL[row["direction"]]
+
+            try:
+                intraday_df = fetch_intraday_linreg_data(pair)
+            except Exception as e:
+                logger.warning(
+                    f"{pair} | execution filter: intraday fetch failed "
+                    f"after retries, dropping candidate: {e}"
+                )
+                return False
+
+            linreg_result = compute_linreg_latest(pair, intraday_df) if intraday_df is not None else None
+            gate = check_direction_agreement(model_direction, linreg_result)
+
+            if gate["passed"]:
+                logger.debug(f"{pair} | execution filter PASSED | {model_direction}")
+            else:
+                logger.info(f"{pair} | execution filter FAILED | {gate['reason']}")
+
+            return gate["passed"]
+
+        execution_filter_mask = display_df.apply(_passes_execution_filter, axis=1)
+        pre_filter_count      = len(display_df)
+        display_df            = display_df[execution_filter_mask].reset_index(drop=True)
+
+        logger.info(
+            f"Execution filter complete | "
+            f"Passed: {len(display_df)}/{pre_filter_count} | "
+            f"Dropped: {pre_filter_count - len(display_df)}"
         )
 
     logger.info("\n[STEP 10] Writing display-threshold predictions to Supabase...")
