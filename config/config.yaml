@@ -65,14 +65,14 @@ execution_filter:
   # slope agrees with the model's direction (BUY needs an up-slope,
   # SELL needs a down-slope). A disagreeing signal is dropped entirely
   # — never written to Supabase, never shown on the dashboard.
-  fetch_interval: "5m"
+  fetch_interval: "1h"
   # ~1 month of 5-min bars, fetched fresh and never persisted. This is
   # headroom for the fit below, not itself the regression window — see
   # linreg_period.
   fetch_days: 30
   # Number of most-recent 5-min closes actually used to fit the LinReg
   # line/slope.
-  linreg_period: 1600
+  linreg_period: 450
 
 scheduler:
   # 
