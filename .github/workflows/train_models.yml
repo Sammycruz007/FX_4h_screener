@@ -18,7 +18,7 @@ on:
     # retraining the models — the two are operationally independent
     # concerns (fetch-and-predict vs. retrain) and can now be
     # triggered separately without coupling one to the other.
-    - cron: '0 3 * * 6'
+    - cron: '0 0 1 * *'
   # Allow manual trigger from GitHub Actions UI — independent from
   # daily_predict.yml's manual trigger. Dispatching THIS workflow
   # retrains models; dispatching daily_predict.yml only fetches data
