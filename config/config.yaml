@@ -32,7 +32,7 @@ logging:
   max_file_size_mb: 10
 
 ml:
-  high_probability_threshold: 0.65
+  high_probability_threshold: 0.68
   # Locked: 3 daily candles ahead. Moved from 2 weekly candles as part
   # of the directional-label redesign (see FX_Directional_Model_Redesign
   # spec) — the label is no longer a plain close(t+H) > close(t) check,
