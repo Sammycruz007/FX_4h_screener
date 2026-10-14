@@ -221,8 +221,27 @@ def _add_business_days(start_date: _datetime.date, n: int) -> _datetime.date:
             added += 1
     return current
 
-LABEL_FORWARD_PERIODS = 2  # matches config.yaml's ml.label_forward_periods
-                            # (daily bars: "2 business days ahead")
+import yaml as _yaml_bootstrap  # needed here, earlier than the main
+                                 # `_yaml` import further down this file
+                                 # (used by _load_baskets()); duplicate
+                                 # import is harmless (Python caches
+                                 # modules) — kept separate rather than
+                                 # reordering the rest of the file.
+
+def _get_label_forward_periods() -> int:
+    """Read ml.label_forward_periods from config.yaml directly, so this
+    caption never drifts out of sync with the value the pipeline and
+    labeller actually train/predict against (this constant was
+    previously hardcoded here and silently went stale when the config
+    value changed — see conversation)."""
+    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
+    with open(config_path, "r") as f:
+        cfg = _yaml_bootstrap.safe_load(f)
+    return cfg["ml"]["label_forward_periods"]
+
+LABEL_FORWARD_PERIODS = _get_label_forward_periods()  # from config.yaml's
+                            # ml.label_forward_periods (daily bars: "N
+                            # business days ahead")
 
 fetch_dates = _cached_get_last_fetch_dates_bulk()  # {pair: "YYYY-MM-DD"}
 
@@ -235,6 +254,29 @@ else:
     }
     oldest_date  = min(parsed_dates.values())
     newest_date  = max(parsed_dates.values())
+
+    # FX-pair-only oldest date — see conversation. fetch_dates/
+    # parsed_dates cover all 33 symbols this project fetches: 28 FX
+    # pairs PLUS 5 macro drivers (DXY, US10Y, VIX, WTI, XAUUSD). Macro
+    # drivers routinely lag FX pairs by a day — different market hours,
+    # different providers — which is normal and not itself a problem.
+    # oldest_date (above, all 33 symbols) is still correct for the
+    # STALENESS WARNING below — a lagging macro driver is genuinely
+    # worth flagging. But oldest_date must NOT be used to decide which
+    # date's PREDICTIONS to query/display: predictions are about FX
+    # pairs, not about DXY or VIX, so a lagging macro driver should
+    # never hide an FX pair's already-written, same-day prediction.
+    # That's exactly the bug this caused — predictions genuinely
+    # written for today were invisible because the query asked for
+    # yesterday's date (macro's date), not today's (the FX pairs' own
+    # date). oldest_fx_date, not oldest_date, is what the predictions
+    # query below must use.
+    _macro_cfg_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
+    with open(_macro_cfg_path, "r") as f:
+        _macro_symbols = set(_yaml_bootstrap.safe_load(f).get("macro", {}).get("drivers", {}).keys())
+
+    fx_only_dates = {p: d for p, d in parsed_dates.items() if p not in _macro_symbols}
+    oldest_fx_date = min(fx_only_dates.values()) if fx_only_dates else oldest_date
 
     # valid_through = the Nth business day itself (the last day the
     # prediction still covers). expires_on = the calendar day
@@ -410,11 +452,11 @@ else:
         with tab:
             basket_predictions = _cached_read_latest_prediction_results(
                 basket=basket_name,
-                as_of_date=oldest_date.isoformat() if fetch_dates else None,
+                as_of_date=oldest_fx_date.isoformat() if fetch_dates else None,
             )
 
             if basket_predictions.empty:
-                date_note = f" for {oldest_date.isoformat()}" if fetch_dates else ""
+                date_note = f" for {oldest_fx_date.isoformat()}" if fetch_dates else ""
                 st.info(
                     f"No predictions cleared the display threshold for "
                     f"{basket_name}{date_note}. This is a normal, honest "
