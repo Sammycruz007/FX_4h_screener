@@ -72,7 +72,7 @@ execution_filter:
   fetch_days: 30
   # Number of most-recent 5-min closes actually used to fit the LinReg
   # line/slope.
-  linreg_period: 450
+  linreg_period: 360
 
 scheduler:
   # 
